@@ -129,6 +129,8 @@ public partial class Report
     /// </summary>
     public DateTime DataBaseDateBeforeUpdate { get; private set; } = DateTime.UtcNow;
 
+    public DateTime DatabaseDateAfterUpdate { get; private set; }
+
     /// <summary>
     /// Boolean that represents whether the current instance is awaiting price updates.
     /// </summary>
@@ -262,12 +264,17 @@ public partial class Report
     /// <returns><see langword="true"/> if no errors are generated; otherwise, <see langword="false"/>.</returns>
     /// <remarks>Price data will only be retrieved if <see cref="IsLegacyCombined"/> is <see langword="true"/>.</remarks>
     /// <exception cref="HttpRequestException">Thrown if unable to connecto to API service.</exception>
+    /// <exception cref="KeyNotFoundException">Thrown if a necessary key for data upload wasn't found.</exception>
+    /// <exception cref="NullReferenceException">Thrown if a null value is returned for a field necessary for data upload.</exception>
+    /// <exception cref="OleDbException">Database error.</exception>
+    /// <exception cref="IndexOutOfRangeException"></exception>
+    /// <exception cref="ArgumentException"></exception>
     public async Task<bool> RetrieveDataAsync(Dictionary<string, string>? priceSymbolByContractCode, bool testMode = false, bool testUpload = false)
     {
         if (!testMode && testUpload) throw new ArgumentException("Cannot test upload if testMode is false.");
 
         ActionTimer.Start();
-        DataBaseDateBeforeUpdate = await ReturnLatestDateInTableAsync(filterForIce: false);
+        DataBaseDateBeforeUpdate = DatabaseDateAfterUpdate = await ReturnLatestDateInTableAsync(filterForIce: false);
         // CurrentStatus is used as alocking flag for non legacy combined instances.
         CurrentStatus = ReportStatusCode.CheckingDataAvailability;
         if (!testMode)
@@ -315,7 +322,6 @@ public partial class Report
         List<string>? databaseFieldNames = null;
 
         int offsetCount = 0, totalRecordsToRetrieve = 0, recordsQueriedCount = 0;
-        DateTime cftcApiMaxDate = DataBaseDateBeforeUpdate;
         bool errorStatus = false;
         try
         {
@@ -327,7 +333,7 @@ public partial class Report
                 // This section will only be run once.
                 if (totalRecordsToRetrieve == 0)
                 {
-                    var countRecordsUrl = $"{_cotApiCode}{outputType}?$select=count(id)&$where=report_date_as_yyyy_mm_dd {comparisonOprator}'{DateOnly.FromDateTime(DataBaseDateBeforeUpdate).ToString("o", CultureInfo.InvariantCulture)}'";
+                    var countRecordsUrl = $"{_cotApiCode}{outputType}?$select=count(id)&$where=report_date_as_yyyy_mm_dd {comparisonOprator}'{DataBaseDateBeforeUpdate:yyyy-MM-dd}'";
                     response = await s_cftcApiClient.GetStringAsync(countRecordsUrl);
 
                     totalRecordsToRetrieve = int.Parse(response.Split("\n")[1].Trim(s_charactersToTrim), NumberStyles.Number, null);
@@ -343,12 +349,13 @@ public partial class Report
                     }
                     CurrentStatus = ReportStatusCode.AttemptingRetrieval;
                 }
-                string apiDetails = $"{_cotApiCode}{outputType}?$where=report_date_as_yyyy_mm_dd{comparisonOprator}'{DateOnly.FromDateTime(DataBaseDateBeforeUpdate).ToString("o", CultureInfo.InvariantCulture)}'&$order=id&$limit={queryReturnLimit}&$offset={offsetCount++}";
+                string apiDetails = $"{_cotApiCode}{outputType}?$where=report_date_as_yyyy_mm_dd{comparisonOprator}'{DataBaseDateBeforeUpdate:yyyy-MM-dd}'&$order=id&$limit={queryReturnLimit}&$offset={offsetCount++}";
                 response = await s_cftcApiClient.GetStringAsync(apiDetails);
 
-                // Parse each line of the response.
+                // Parse each line of the response and ensure that its date is valid and wanted.
                 if (!errorStatus && response != null)
                 {
+                    // Data from the API tends to have an extra line at the end so trim it.
                     responseLines = response.Trim('\n').Split('\n');
                     response = null;
                     // Subtract 1 to account for headers.
@@ -383,8 +390,8 @@ public partial class Report
                                     priceByDate.TryAdd(parsedDate, null);
                                 }
                                 cftcData.Add(apiRecord);
-                                // Update cftcApiMaxDate so that the code knows the max ICE date to look for in later code..
-                                if (QueriedReport == ReportType.Disaggregated && parsedDate > cftcApiMaxDate) cftcApiMaxDate = parsedDate;
+                                // Update DatabaseDateAfterUpdate so that the code knows the max ICE date to look for in later code..
+                                if (parsedDate > DatabaseDateAfterUpdate) DatabaseDateAfterUpdate = parsedDate;
                             }
                         }
                     }
@@ -399,23 +406,23 @@ public partial class Report
             {
                 DateTime maxIceDateInDatabase = await ReturnLatestDateInTableAsync(filterForIce: true);
 
-                if (maxIceDateInDatabase < cftcApiMaxDate || testMode)
+                if (maxIceDateInDatabase < DatabaseDateAfterUpdate || testMode)
                 {
                     const int MaxDayDifference = 9;
-                    bool singleWeekRetrieval = (cftcApiMaxDate - maxIceDateInDatabase).Days <= MaxDayDifference || testMode;
+                    bool singleWeekRetrieval = (DatabaseDateAfterUpdate - maxIceDateInDatabase).Days <= MaxDayDifference || testMode;
                     const string WeeklyIceKey = "Weekly_ICE";
 
                     Interlocked.Increment(ref s_activeIceRetrievalCount);
                     // nulls ae added instead of Tasks because the compiler will attempt to execute the task instead of immediately checking the key.
                     if (singleWeekRetrieval && s_iceCsvRawData.TryAdd(WeeklyIceKey, null))
                     {
-                        string iceCsvUrl = $"https://www.ice.com/publicdocs/cot_report/automated/COT_{cftcApiMaxDate:ddMMyyyy}.csv";
+                        string iceCsvUrl = $"https://www.ice.com/publicdocs/cot_report/automated/COT_{DatabaseDateAfterUpdate:ddMMyyyy}.csv";
                         s_iceCsvRawData.TryUpdate(WeeklyIceKey, QueryIceDataAsync(iceCsvUrl, databaseFieldNames!, testMode), null);
                     }
                     else if (!singleWeekRetrieval)
                     {
                         const int IceStartYear = 2011;
-                        for (var csvYear = maxIceDateInDatabase.Year; csvYear <= cftcApiMaxDate.Year; ++csvYear)
+                        for (var csvYear = maxIceDateInDatabase.Year; csvYear <= DatabaseDateAfterUpdate.Year; ++csvYear)
                         {
                             string iceCsvUrl = $"https://www.ice.com/publicdocs/futures/COTHist{csvYear}.csv";
                             if (csvYear >= IceStartYear && s_iceCsvRawData.TryAdd(iceCsvUrl, null))
@@ -537,19 +544,16 @@ public partial class Report
                     iceDateColumn = (int)s_iceColumnMap[s_standardDateFieldName]?.ColumnIndex!;
                     iceShortDateColumn = (int)s_iceColumnMap.First(x => x.Key.Contains(IceShortDateFormat, StringComparison.InvariantCultureIgnoreCase)).Value?.ColumnIndex!;
                 }
-                else
+                else if (DateTime.TryParseExact(iceCsvRecord[iceShortDateColumn], IceShortDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces, out DateTime parsedDate))
                 {
-                    if (DateTime.TryParseExact(iceCsvRecord[iceShortDateColumn], IceShortDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces, out DateTime parsedDate))
-                    {
-                        iceCsvRecord = iceCsvRecord.Select(x => x.Trim(s_charactersToTrim)).ToArray();
-                        iceCsvRecord[iceDateColumn] = parsedDate.ToString(StandardDateFormat);
+                    iceCsvRecord = iceCsvRecord.Select(x => x.Trim(s_charactersToTrim)).ToArray();
+                    iceCsvRecord[iceDateColumn] = parsedDate.ToString(StandardDateFormat);
 
-                        if (!csvDataByDateTime.TryGetValue(parsedDate, out List<string[]>? dataGroupedByDate))
-                        {
-                            dataGroupedByDate = csvDataByDateTime[parsedDate] = new();
-                        }
-                        dataGroupedByDate.Add(iceCsvRecord);
+                    if (!csvDataByDateTime.TryGetValue(parsedDate, out List<string[]>? dataGroupedByDate))
+                    {
+                        dataGroupedByDate = csvDataByDateTime[parsedDate] = new();
                     }
+                    dataGroupedByDate.Add(iceCsvRecord);
                 }
             }
         }
@@ -658,11 +662,10 @@ public partial class Report
     static async Task RetrieveYahooPriceDataAsync(Dictionary<string, string> priceSymbolByContractCode, Dictionary<string, Dictionary<DateTime, string?>> pricesPerContractCode)
     {
         const string BaseUrl = "https://query1.finance.yahoo.com/v7/finance/download/";
-        using HttpClient priceRetrievalClient = new()
-        {
-            BaseAddress = new Uri(BaseUrl)
-        };
+
+        using HttpClient priceRetrievalClient = new() { BaseAddress = new Uri(BaseUrl) };
         priceRetrievalClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("text/csv"));
+
         const byte YahooDateColumn = 0, YahooCloseColumn = 5;
 
         foreach (var knownSymbol in priceSymbolByContractCode)
@@ -916,7 +919,7 @@ public partial class Report
             }
             else if (!iceHeaders)
             {
-                // These endings are sorted by the order in which they appear within the api headers.
+                // These endings are sorted by the orde r in which they appear within the api headers.
                 string[] endings = { "_all", "_old", "_other" };
                 // Remove endings from editedTableFieldName until a match is found within headerIndexesByEditedName.
                 // Once found map column and then attempt to find additional substitutions.

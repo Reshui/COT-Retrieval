@@ -98,7 +98,7 @@ if (OperatingSystem.IsWindows() && (args.Length == 2 || args.Length == 0))
     foreach (var (instance, retrievalTask) in updatingTasks)
     {
         instance.DisposeConnection();
-        string baseText = $"{instance.QueriedReport}:{{Combined: {instance.RetrieveCombinedData}, Time Elapsed: {instance.ActionTimer.Elapsed.Milliseconds}ms, Status: {instance.CurrentStatus}}}";
+        string baseText = $"{instance.QueriedReport}:{{Combined: {instance.RetrieveCombinedData}, Time Elapsed: {instance.ActionTimer.Elapsed.Milliseconds}ms, Latest Date: {instance.DatabaseDateAfterUpdate:yyyy-MM-dd}, Status: {(int)instance.CurrentStatus}}}";
         outputText.AppendLine(baseText);
 
         if (retrievalTask.IsFaulted)
