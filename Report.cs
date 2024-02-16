@@ -21,6 +21,8 @@ public partial class Report
     /// <summary>
     /// Gets or sets an enum that represnts the current state of the instance.
     /// </summary>
+    /// <value>The current value of the backing field <see cref="_currentStatus"/></value>
+    /// <remarks>IF <see cref="IsLegacyCombined"/> is <see langword="true"/> then <see cref="s_retrievalLockingStatusCode"/> will also be updated.</remarks>
     public ReportStatusCode CurrentStatus
     {
         get => _currentStatus;
@@ -54,7 +56,7 @@ public partial class Report
     /// <summary>
     /// DateTime returned when an instance for Legacy_Combined data queries the database for the most recent date.
     /// </summary>
-    /// <remarks>Assigned a value in <see cref="RetrieveDataAsync"/></remarks>
+    /// <remarks>Assigned a value in <see cref="CommitmentsOfTradersRetrievalAndUploadAsync"/></remarks>
     private static DateTime s_ceilingDateForRetrievalPermission;
 
     /// <summary>
@@ -68,7 +70,7 @@ public partial class Report
     private static Dictionary<string, FieldInfo?>? s_iceColumnMap = null;
 
     /// <summary>
-    /// Dictionary of connection objects used for each report type.
+    /// Dictionary of <see cref="OleDbConnection"/> objects used for each <see cref="ReportType"/>.
     /// </summary>
     private static readonly Dictionary<ReportType, OleDbConnection> s_oleDbConnectionsByReportType = new();
 
@@ -91,6 +93,7 @@ public partial class Report
     /// <summary>
     /// Date before the inception of the Commitments of Traders Report.
     /// </summary>
+    /// <value>An instance initialized to January 1, 1970.</value>
     static readonly DateTime s_defaultStartDate = new(1970, 1, 1);
 
     /// <summary>
@@ -110,28 +113,30 @@ public partial class Report
     public bool IsLegacyCombined { get; }
 
     /// <summary>
-    /// Identification code used to target the relevant dataset.
+    /// Gets an identification code used to target the relevant CFTC API code.
     /// </summary>
-    private readonly string _cotApiCode;
+    private string CftcApiCode { get; }
 
     /// <summary>
-    /// Gets a <see cref="ReportType"/> enum that specifies what C.O.T type to target.
+    /// Gets a <see cref="ReportType"/> enum.
     /// </summary>
+    /// <value>An enum that specifies which Commitments of Traders Report this instance will target.</value>
     public ReportType QueriedReport { get; }
 
     /// <summary>
-    /// Gets a table name based on instance variables found within <see cref="DatabasePath"/>.
+    /// Gets a string representing the name of the table to target within <see cref="DatabasePath"/>.
     /// </summary>
     private string SqlTableDataName { get; }
 
     /// <summary>
     /// The largest date contained within <see cref="DatabasePath"/> before data is retrieved from the api.
     /// </summary>
-    public DateTime DataBaseDateBeforeUpdate { get; private set; }
+    public DateTime DatabaseDateBeforeUpdate { get; private set; }
 
     /// <summary>
-    /// Date used to keep track of the largest date contained retrieved from a CFTC data query.
+    /// Gets or sets a DateTimve instance used to keep track of the largest date returned from a CFTC data query.
     /// </summary>
+    /// <value>The largest date returned when querying CFTC data.</value>
     public DateTime DatabaseDateAfterUpdate { get; private set; }
 
     /// <summary>
@@ -151,19 +156,20 @@ public partial class Report
     private bool _waitingForPriceUpdate = false;
 
     /// <summary>
-    /// Boolean that specifies if the current instance is tied to Futures + Options data.
+    /// Gets a value that specifies if the current instance is tied to Futures + Options data.
     /// </summary>
     /// <value><see langword="true"/> if instance is dedicated to Futures + Options data; otherwise, <see langword="false"/> if designated for Futures only.</value>
     public bool RetrieveCombinedData { get; }
 
     /// <summary>
-    /// Gets a path to a database C.O.T database related to this instance's <see cref="QueriedReport"/> value.
+    /// Gets the file path to the database that data will be uploaded to.
     /// </summary>
     public string DatabasePath { get; }
 
     /// <summary>
-    /// Boolean used to toggle off or limit certain functionalities in this instance
+    /// Gets a value used to toggle off or limit certain functionalities in this instance
     /// </summary>
+    /// <value><see langword="true"/> if currently debugging otherwise <see langword="false"/></value>
     private bool DebugActive { get; }
 
     /// <summary>
@@ -209,10 +215,15 @@ public partial class Report
         /// Name of the field within the database.
         /// </summary>
         public string ColumnName { get; }
+
         /// <summary>
         /// Edited version of <see cref="ColumnName"/> 
         /// </summary>
         public string EditedColumnName { get; }
+        /// <summary>
+        /// Adjusts <see cref="ColumnName"/> so that it is database compatible.
+        /// </summary>
+        /// <value>Returns <see cref="ColumnName"/> enclosed in square brackets.</value>
         public string DatabaseAdjustedName => $"[{ColumnName}]";
 
         public FieldInfo(int columnIndex, string columnName, string editedColumnName)
@@ -245,13 +256,18 @@ public partial class Report
     /// <summary>
     /// Initializes a new instance of the Report class with the specified properties.
     /// </summary>
-    /// <param name="queriedReport">A ReportType enum used to specify what sort of data should be retrieved with this instance.</param>
+    /// <param name="queriedReport">A <see cref="ReportType"/> enum used to specify what sort of data should be retrieved with this instance.</param>
     /// <param name="retrieveCombinedData"><see langword="true"/> if Futures + Options data should be filtered for; otherwise, <see langword="false"/> for Futures Only data.</param>
     /// <param name="databasePath">File path to database that data should be stored in.</param>
     /// <exception cref="FileNotFoundException">Thrown if <paramref name="databasePath"/> cannot be found.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown if an <paramref name="queriedReport"/> is out of range.</exception>
     public Report(ReportType queriedReport, bool retrieveCombinedData, string databasePath, string tableName, bool useDebugMode = false)
     {
-        if (!File.Exists(databasePath)) throw new FileNotFoundException($"{databasePath} wasn't found.");
+        if (!File.Exists(databasePath)) throw new FileNotFoundException($"{nameof(databasePath)} doesn't exist.", databasePath);
+        if (!new ReportType[] { ReportType.Legacy, ReportType.Disaggregated, ReportType.TFF }.Any(x => x.Equals(queriedReport)))
+        {
+            throw new ArgumentOutOfRangeException(nameof(queriedReport), queriedReport, "Unsupported ReportType detected.");
+        }
 
         QueriedReport = queriedReport;
         RetrieveCombinedData = retrieveCombinedData;
@@ -259,7 +275,7 @@ public partial class Report
         SqlTableDataName = tableName;
         DebugActive = useDebugMode;
         IsLegacyCombined = queriedReport == ReportType.Legacy && retrieveCombinedData;
-        _cotApiCode = s_apiIdentification[retrieveCombinedData][queriedReport];
+        CftcApiCode = s_apiIdentification[retrieveCombinedData][queriedReport];
 
         s_oleDbConnectionsByReportType.TryAdd(queriedReport, new OleDbConnection(DatabaseConnectionString));
     }
@@ -267,7 +283,7 @@ public partial class Report
     /// <summary>
     /// Retrieves related data from api and uploads to a local database if new data is retrieved.
     /// </summary>
-    /// <param name="priceSymbolByContractCode">Dictionary of price symbols keyed to cftc contract codes.</param>
+    /// <param name="yahooPriceSymbolByContractCode">Dictionary of price symbols keyed to cftc contract codes.</param>
     /// <param name="testUpload">If <see langword="true"/> and <see cref="DebugActive"/> is <see langword="true"/> then data upload will be tested.</param>
     /// <returns><see langword="true"/> if no errors are generated; otherwise, <see langword="false"/>.</returns>
     /// <remarks>Price data will only be retrieved if <see cref="IsLegacyCombined"/> is <see langword="true"/>.</remarks>
@@ -277,12 +293,12 @@ public partial class Report
     /// <exception cref="OleDbException">Database error.</exception>
     /// <exception cref="IndexOutOfRangeException"></exception>
     /// <exception cref="ArgumentException"></exception>
-    public async Task<bool> CommitmentsOfTradersRetrievalAndUploadAsync(Dictionary<string, string>? priceSymbolByContractCode, bool testUpload = false)
+    public async Task CommitmentsOfTradersRetrievalAndUploadAsync(Dictionary<string, string>? yahooPriceSymbolByContractCode, bool testUpload = false)
     {
         if (!DebugActive && testUpload) throw new ArgumentException($"Cannot test upload if {nameof(DebugActive)} is false.");
 
         ActionTimer.Start();
-        DataBaseDateBeforeUpdate = DatabaseDateAfterUpdate = await ReturnLatestDateInTableAsync(filterForIce: false);
+        DatabaseDateBeforeUpdate = DatabaseDateAfterUpdate = await ReturnLatestDateInTableAsync(filterForIce: false);
         // CurrentStatus is used as alocking flag for non legacy combined instances.
         CurrentStatus = ReportStatusCode.CheckingDataAvailability;
         if (!DebugActive)
@@ -297,16 +313,16 @@ public partial class Report
                 }
 
                 var failureCodes = new ReportStatusCode[] { ReportStatusCode.NoUpdateAvailable, ReportStatusCode.Failure };
-                if (failureCodes.Contains(s_retrievalLockingStatusCode) && DataBaseDateBeforeUpdate >= s_ceilingDateForRetrievalPermission)
+                if (failureCodes.Contains(s_retrievalLockingStatusCode) && DatabaseDateBeforeUpdate >= s_ceilingDateForRetrievalPermission)
                 {
                     CurrentStatus = ReportStatusCode.NoUpdateAvailable;
-                    return true;
+                    return;
                 }
                 ActionTimer.Start();
             }
             else
             {
-                s_ceilingDateForRetrievalPermission = DataBaseDateBeforeUpdate;
+                s_ceilingDateForRetrievalPermission = DatabaseDateBeforeUpdate;
             }
         }
 
@@ -315,7 +331,6 @@ public partial class Report
         Dictionary<string, FieldInfo?> fieldInfoByEditedName = new();
         List<string>? databaseFieldNames = null;
 
-        bool errorStatus = false;
         try
         {
             List<string[]> cftcData = await CftcCotRetrievalAsync(queryReturnLimit, fieldInfoByEditedName, priceByDateByContractCode, databaseFieldNames);
@@ -328,7 +343,7 @@ public partial class Report
 
             if (cftcData.Any())
             {
-                if (IsLegacyCombined && priceSymbolByContractCode != null && fieldInfoByEditedName.ContainsKey("price"))
+                if (IsLegacyCombined && yahooPriceSymbolByContractCode != null && fieldInfoByEditedName.ContainsKey("price"))
                 {
                     bool retrievePrices = true;
                     if (DebugActive)
@@ -337,22 +352,29 @@ public partial class Report
                         var keyResponse = Console.ReadKey(true);
                         if (keyResponse.Key != ConsoleKey.Y) retrievePrices = false;
                     }
-                    if (retrievePrices) await RetrieveYahooPriceDataAsync(priceSymbolByContractCode, priceByDateByContractCode);
+                    if (retrievePrices) await RetrieveYahooPriceDataAsync(yahooPriceSymbolByContractCode, priceByDateByContractCode);
                 }
 
                 if (!DebugActive || testUpload)
                 {
-                    CurrentStatus = ReportStatusCode.AttemptingUpdate;
-
-                    errorStatus = !UploadToDatabase(fieldInfoByEditedName!, cftcData, uploadingIceData: false, priceData: priceByDateByContractCode);
                     if (QueriedReport == ReportType.Disaggregated && iceData != null && iceData.Any())
                     {
-                        errorStatus = !UploadToDatabase(s_iceColumnMap!, iceData, uploadingIceData: true);
+                        try
+                        {
+                            UploadToDatabase(fieldInfoPerEditedName: s_iceColumnMap!, dataToUpload: iceData, uploadingIceData: true);
+                        }
+                        catch (Exception e)
+                        {   // ICE is low priority.
+                            Console.WriteLine(e);
+                        }
                     }
-                    if (!errorStatus) CurrentStatus = ReportStatusCode.Updated;
+                    //  false indicates that data failed to be uploaded.
+                    if (false == UploadToDatabase(fieldInfoPerEditedName: fieldInfoByEditedName!, dataToUpload: cftcData, uploadingIceData: false, priceData: priceByDateByContractCode))
+                    {
+                        CurrentStatus = ReportStatusCode.Failure;
+                    }
                 }
             }
-            if (errorStatus) CurrentStatus = ReportStatusCode.Failure;
         }
         catch (Exception)
         {
@@ -363,22 +385,20 @@ public partial class Report
         {
             ActionTimer.Stop();
         }
-
-        return !errorStatus;
     }
 
     /// <summary>
-    /// Retrieves CFTC C.O.T data from an API.
+    /// Retrieves CFTC Commitments of Traders data if any data is more recent than the current value of <see cref="DatabaseDateBeforeUpdate"/>. 
     /// </summary>
     /// <param name="maxRecordsPerLoop">Number used to limit the number of records retrieved from each loop attempt.</param>
-    /// <param name="fieldInfoByEditedName">Empty dictionary to populate with FieldInfo instances.</param>
+    /// <param name="fieldInfoByEditedName">Empty dictionary to populate with <see cref="FieldInfo"/> instances.</param>
     /// <param name="priceByDateByContractCode">Used to store null values for wanted price data.</param>
     /// <param name="databaseFieldNames">List of headers from table in local database that data will be uploaded to.</param>
     /// <returns>An asynchronous task.</returns>
     /// <exception cref="FormatException"></exception>
-    /// <exception cref="HttpRequestException"></exception>
-    /// <exception cref="KeyNotFoundException"></exception>
-    /// <exception cref="NullReferenceException"></exception>
+    /// <exception cref="HttpRequestException">Thrown if an error occurs while attempting to access the CFTC API.</exception>
+    /// <exception cref="KeyNotFoundException">Thrown if an unknown key is used to access <paramref name="fieldInfoByEditedName"/>.</exception>
+    /// <exception cref="NullReferenceException">Thrown if an attempt to use a null value from <paramref name="fieldInfoByEditedName"/>.</exception>
     private async Task<List<string[]>> CftcCotRetrievalAsync(int maxRecordsPerLoop, Dictionary<string, FieldInfo?>? fieldInfoByEditedName, Dictionary<string, Dictionary<DateTime, string?>> priceByDateByContractCode, List<string>? databaseFieldNames)
     {
         // https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types
@@ -405,7 +425,7 @@ public partial class Report
             // This section will only be run once.
             if (totalRecordsToRetrieve == 0)
             {
-                var countRecordsUrl = $"{_cotApiCode}{WantedDataFormat}?$select=count(id)&$where=report_date_as_yyyy_mm_dd {comparisonOprator}'{DataBaseDateBeforeUpdate.ToString(StandardDateFormat)}'";
+                var countRecordsUrl = $"{CftcApiCode}{WantedDataFormat}?$select=count(id)&$where=report_date_as_yyyy_mm_dd {comparisonOprator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'";
                 response = await s_cftcApiClient.GetStringAsync(countRecordsUrl);
 
                 totalRecordsToRetrieve = int.Parse(response.Split('\n')[1].Trim(s_charactersToTrim), NumberStyles.Number, null);
@@ -421,7 +441,7 @@ public partial class Report
                 }
                 CurrentStatus = ReportStatusCode.AttemptingRetrieval;
             }
-            string apiDetails = $"{_cotApiCode}{WantedDataFormat}?$where=report_date_as_yyyy_mm_dd{comparisonOprator}'{DataBaseDateBeforeUpdate.ToString(StandardDateFormat)}'&$order=id&$limit={maxRecordsPerLoop}&$offset={offsetCount++}";
+            string apiDetails = $"{CftcApiCode}{WantedDataFormat}?$where=report_date_as_yyyy_mm_dd{comparisonOprator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'&$order=id&$limit={maxRecordsPerLoop}&$offset={offsetCount++}";
             response = await s_cftcApiClient.GetStringAsync(apiDetails);
 
             // Parse each line of the response and ensure that its date is valid and wanted.
@@ -450,7 +470,7 @@ public partial class Report
                         string[] apiRecord = SplitOnCommaNotWithinQuotesRegex().Split(responseLines[i]).Select(x => x.Trim(s_charactersToTrim)).ToArray();
 
                         if (DateTime.TryParseExact(apiRecord[cftcDateColumn], StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime parsedDate)
-                        && ((parsedDate > DataBaseDateBeforeUpdate && !DebugActive) || (parsedDate >= DataBaseDateBeforeUpdate && DebugActive)))
+                        && ((parsedDate > DatabaseDateBeforeUpdate && !DebugActive) || (parsedDate >= DatabaseDateBeforeUpdate && DebugActive)))
                         {   // Create a null entry for the current combination of contract code and date within priceByDateByContractCode.
                             if (IsLegacyCombined)
                             {
@@ -602,14 +622,23 @@ public partial class Report
     /// <param name="dataToUpload">A list of string arrays that data will be pulled from and uploaded to the database.</param>
     /// <param name="priceData">Dictionary of price information only supplied when <see cref="IsLegacyCombined"/> equals <see langword="true"/>.</param>
     /// <param name="uploadingIceData"><see langword="true"/> if uploading ICE data; otherwise, <see langword="false"/> for CFTC data.</param>  
-    /// <returns><see langword="true"/> if no errors are generated; otherwise, <see langword="false"/>.</returns>
+    /// <returns><see langword="true"/> if date was successfully uploaded; otherwise, <see langword="false"/>.</returns>
+    /// <remarks>Method isn't asynchronous because attempts to use the same <see cref="DatabaseConnection"/> instance from different threads will result in an error.</remarks>
+    /// <exception cref="NullReferenceException"></exception>
+    /// <exception cref="KeyNotFoundException">Thrown if an unknown key is used to access <paramref name="fieldInfoPerEditedName"/>.</exception>
+    /// <exception cref="IndexOutOfRangeException">Thrown if a wanted index is out of bounds fora an array in <paramref name="dataToUpload"/>.</exception>
+    /// <exception cref="OleDbException">Error related to database interaction.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown if a field type is unaccounted for when assigning a value to a parameter.</exception>
     bool UploadToDatabase(Dictionary<string, FieldInfo?> fieldInfoPerEditedName, List<string[]> dataToUpload, bool uploadingIceData, Dictionary<string, Dictionary<DateTime, string?>>? priceData = null)
     {
-        // The value doesn't matter.
-        const int PriceIndex = -1;
+        CurrentStatus = ReportStatusCode.AttemptingUpdate;
 
         bool updatePrices = IsLegacyCombined && !(priceData == null || uploadingIceData);
-        if (updatePrices && fieldInfoPerEditedName.ContainsKey("price")) fieldInfoPerEditedName["price"] = new FieldInfo(columnIndex: PriceIndex, editedColumnName: "price", columnName: "Price");
+        if (updatePrices && fieldInfoPerEditedName.ContainsKey("price"))
+        {   // The value of PriceIndex doesn't matter.
+            const int PriceIndex = -1;
+            fieldInfoPerEditedName["price"] = new FieldInfo(columnIndex: PriceIndex, editedColumnName: "price", columnName: "Price");
+        }
 
         lock (DatabaseConnection)
         {
@@ -676,7 +705,9 @@ public partial class Report
                     cmd.ExecuteNonQuery();
                 }
                 transaction.Commit();
+
                 if (!(IsLegacyCombined || uploadingIceData)) _waitingForPriceUpdate = true;
+                CurrentStatus = ReportStatusCode.Updated;
             }
             finally
             {
@@ -689,10 +720,10 @@ public partial class Report
     /// <summary>
     /// Asynchronously queries yahoo finance for price data and updates dictionaries within <paramref name="priceByDateByContractCode"/>.
     /// </summary>
-    /// <param name="priceSymbolByContractCode">Dictionary of price symbols keyed to cftc contract codes.</param>
+    /// <param name="yahooPriceSymbolByContractCode">Dictionary of price symbols keyed to cftc contract codes.</param>
     /// <param name="priceByDateByContractCode">A contract code keyed dictionary that contains a dictionary keyed to wanted dates for the given contract code.</param>
     /// <returns>An asynchronous task.</returns>
-    static async Task RetrieveYahooPriceDataAsync(Dictionary<string, string> priceSymbolByContractCode, Dictionary<string, Dictionary<DateTime, string?>> priceByDateByContractCode)
+    static async Task RetrieveYahooPriceDataAsync(Dictionary<string, string> yahooPriceSymbolByContractCode, Dictionary<string, Dictionary<DateTime, string?>> priceByDateByContractCode)
     {
         const string BaseUrl = "https://query1.finance.yahoo.com/v7/finance/download/";
 
@@ -701,7 +732,7 @@ public partial class Report
 
         const byte YahooDateColumn = 0, YahooCloseColumn = 5;
 
-        foreach (var knownSymbol in priceSymbolByContractCode)
+        foreach (var knownSymbol in yahooPriceSymbolByContractCode)
         {
             if (priceByDateByContractCode.TryGetValue(knownSymbol.Key, out Dictionary<DateTime, string?>? wantedPrices))
             {
@@ -742,8 +773,7 @@ public partial class Report
     async Task<DateTime> ReturnLatestDateInTableAsync(bool filterForIce)
     {
         if (filterForIce && QueriedReport != ReportType.Disaggregated) throw new InvalidOperationException($"{nameof(QueriedReport)} must be {nameof(ReportType.Disaggregated)} while {nameof(filterForIce)} is true.");
-        using OleDbConnection con = new(DatabaseConnectionString);
-        using OleDbCommand cmd = con.CreateCommand();
+        using OleDbCommand cmd = DatabaseConnection.CreateCommand();
 
         string iceCodes = "('B','Cocoa','G','RC','Wheat','W')";
 
@@ -752,7 +782,7 @@ public partial class Report
 
         try
         {
-            await con.OpenAsync();
+            await DatabaseConnection.OpenAsync();
             storedDate = ((DateTime?)await cmd.ExecuteScalarAsync()) ?? s_defaultStartDate;
         }
         catch (Exception e)
@@ -761,7 +791,7 @@ public partial class Report
         }
         finally
         {
-            con.Close();
+            DatabaseConnection.Close();
         }
 
         return storedDate;
@@ -783,7 +813,7 @@ public partial class Report
 
         using OleDbCommand cmd = DatabaseConnection.CreateCommand();
         cmd.CommandText = sqlCommand;
-        cmd.Parameters.AddWithValue("@GreaterThanDate", DataBaseDateBeforeUpdate);
+        cmd.Parameters.AddWithValue("@GreaterThanDate", DatabaseDateBeforeUpdate);
         // cmd.Parameters.AddWithValue("nullPrice", DBNull.Value);
 
         lock (DatabaseConnection)
@@ -813,14 +843,13 @@ public partial class Report
     /// <returns>A list of field names found within the database.</returns>
     async Task<List<string>> QueryDatabaseFieldNamesAsync()
     {
-        using OleDbConnection con = new(DatabaseConnectionString);
-        using OleDbCommand cmd = con.CreateCommand();
+        using OleDbCommand cmd = DatabaseConnection.CreateCommand();
 
         cmd.CommandText = $"SELECT TOP 1 * FROM {SqlTableDataName};";
         List<string> fieldNames = new();
         try
         {
-            await con.OpenAsync();
+            await DatabaseConnection.OpenAsync();
 
             using var reader = await cmd.ExecuteReaderAsync();
 
@@ -837,11 +866,14 @@ public partial class Report
         }
         finally
         {
-            con.Close();
+            DatabaseConnection.Close();
         }
         return fieldNames;
     }
 
+    /// <summary>
+    /// Disposes the OleDbConnection associated with this instance.
+    /// </summary>
     public void DisposeConnection()
     {
         DatabaseConnection.Dispose();
@@ -853,7 +885,7 @@ public partial class Report
     /// <param name="externalHeaders">Array of field names from an external source that need to be aligned with database fields.</param>
     /// <param name="databaseFields">List of field names found within the database.</param>
     /// <param name="iceHeaders"><see langword="true"/> if <paramref name="externalHeaders"/> are from an ICE C.O.T report; otherwise, <see langword="false"/> for CFTC reports.</param>
-    /// <returns>Returns a dictionary of FieldInfo instances keyed to their edited names if the field exists in both <paramref name="externalHeaders"/> and <paramref name="databaseFields"/>; otherwise, a value of null.</returns> 
+    /// <returns>Returns a dictionary of <see cref="FieldInfo"/> instances keyed to their edited names if the field exists in both <paramref name="externalHeaders"/> and <paramref name="databaseFields"/>; otherwise, a value of null.</returns> 
     static Dictionary<string, FieldInfo?> MapHeaderFieldsToDatabase(string[] externalHeaders, List<string> databaseFields, bool iceHeaders)
     {
         // return dictionary keyed to fields within databaseFields with wanted FieldInfo structs as a value 
@@ -960,19 +992,19 @@ public partial class Report
                 {
                     if (editedTableFieldName.EndsWith(endings[primaryEndingsIndex]))
                     {
-                        string baseKey = editedTableFieldName.Replace(endings[primaryEndingsIndex], string.Empty);
+                        string endingStrippedName = editedTableFieldName.Replace(endings[primaryEndingsIndex], string.Empty);
                         // _1 can represent old or other so it's important that its addition be independent of primaryEndingsIndex.
                         byte digitIncrement = 0;
                         for (byte secondaryEndingsIndex = primaryEndingsIndex; secondaryEndingsIndex < endings.Length; ++secondaryEndingsIndex)
                         {
                             string? newKey = null;
-                            if (secondaryEndingsIndex == primaryEndingsIndex && headerIndexesByEditedName.Remove(baseKey, out columnIndex))
+                            if (secondaryEndingsIndex == primaryEndingsIndex && headerIndexesByEditedName.Remove(endingStrippedName, out columnIndex))
                             {
                                 newKey = editedTableFieldName;
                             }
-                            else if (secondaryEndingsIndex > primaryEndingsIndex && headerIndexesByEditedName.Remove(baseKey + $"_{++digitIncrement}", out columnIndex))
+                            else if (secondaryEndingsIndex > primaryEndingsIndex && headerIndexesByEditedName.Remove(endingStrippedName + $"_{++digitIncrement}", out columnIndex))
                             {
-                                newKey = baseKey + endings[secondaryEndingsIndex];
+                                newKey = endingStrippedName + endings[secondaryEndingsIndex];
                             }
 
                             if (!string.IsNullOrEmpty(newKey)) fieldInfoByEditedName[newKey] = new FieldInfo(columnIndex, originalFieldByEditedName[newKey], newKey);

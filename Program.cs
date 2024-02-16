@@ -35,9 +35,23 @@ if (OperatingSystem.IsWindows() && (args.Length == 2 || args.Length == 0))
     }
 
     var filePathByReportType = JsonSerializer.Deserialize<Dictionary<string, string>>(databaseString)!;
-    var priceSymbolByContractCode = JsonSerializer.Deserialize<Dictionary<string, string>>(priceString);
+    var priceSymbolByContractCode = JsonSerializer.Deserialize<Dictionary<string, string>>(priceString)!;
+    /*
+    if (args.Length == 2)
+    {
+        foreach (var kvp in filePathByReportType)
+        {
+            Console.WriteLine(kvp.ToString());
+        }
 
-    Dictionary<Report, Task<bool>> updatingTasks = new();
+        foreach (var kvp in priceSymbolByContractCode)
+        {
+            Console.WriteLine(kvp.ToString());
+        }
+        Console.ReadKey();
+    }
+    */
+    Dictionary<Report, Task> updatingTasks = new();
     bool testUpload = false;
 
     if (debugMode)
@@ -62,8 +76,8 @@ if (OperatingSystem.IsWindows() && (args.Length == 2 || args.Length == 0))
             if (filePathByReportType.TryGetValue(reportType.ToString(), out string? filePath) && File.Exists(filePath))
             {
                 var tableToTarget = $"{reportType}_{(retrieveCombinedData == true ? "Combined" : "Futures_Only")}";
-                var reportInstance = new Report(reportType, retrieveCombinedData, filePath, tableToTarget);
-                updatingTasks.Add(reportInstance, reportInstance.RetrieveDataAsync(reportInstance.IsLegacyCombined ? priceSymbolByContractCode : null, debugMode, testUpload));
+                var reportInstance = new Report(reportType, retrieveCombinedData, filePath, tableToTarget, debugMode);
+                updatingTasks.Add(reportInstance, reportInstance.CommitmentsOfTradersRetrievalAndUploadAsync(reportInstance.IsLegacyCombined ? priceSymbolByContractCode : null, testUpload));
             }
             if (debugMode) break;
         }
