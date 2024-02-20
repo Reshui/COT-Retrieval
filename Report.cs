@@ -57,7 +57,7 @@ public partial class Report
     /// DateTime returned when an instance for Legacy_Combined data queries the database for the most recent date.
     /// </summary>
     /// <remarks>Assigned a value in <see cref="CommitmentsOfTradersRetrievalAndUploadAsync"/></remarks>
-    private static DateTime s_ceilingDateForRetrievalPermission;
+    private static DateTime s_retrievalLockingDate;
 
     /// <summary>
     /// Dictionary used to store downloaded ICE COT data regardless of <see cref="RetrieveCombinedData"/>'s value.
@@ -292,7 +292,7 @@ public partial class Report
     /// <exception cref="KeyNotFoundException">Thrown if a necessary key for data upload wasn't found.</exception>
     /// <exception cref="NullReferenceException">Thrown if a null value is returned for a field necessary for data upload.</exception>
     /// <exception cref="OleDbException">Database error.</exception>
-    /// <exception cref="IndexOutOfRangeException"></exception>
+    /// <exception cref="IndexOutOfRangeException">Indicates an error in record length returned from source.</exception>
     /// <exception cref="ArgumentException"></exception>
     public async Task CommitmentsOfTradersRetrievalAndUploadAsync(Dictionary<string, string>? yahooPriceSymbolByContractCode, bool testUpload = false)
     {
@@ -300,10 +300,11 @@ public partial class Report
 
         ActionTimer.Start();
         DatabaseDateBeforeUpdate = DatabaseDateAfterUpdate = await ReturnLatestDateInTableAsync(filterForIce: false).ConfigureAwait(false);
-        // CurrentStatus is used as alocking flag for non legacy combined instances.
         CurrentStatus = ReportStatusCode.CheckingDataAvailability;
+
         if (!DebugActive)
         {
+            // Wait until after the Legacy_Combined instance has attempted CFTC retrieval before continuing.
             if (!IsLegacyCombined)
             {
                 // Loop until a change in state is detected in the running Legacy Combined instance.
@@ -314,7 +315,7 @@ public partial class Report
                 }
 
                 var failureCodes = new ReportStatusCode[] { ReportStatusCode.NoUpdateAvailable, ReportStatusCode.Failure };
-                if (failureCodes.Contains(s_retrievalLockingStatusCode) && DatabaseDateBeforeUpdate >= s_ceilingDateForRetrievalPermission)
+                if (failureCodes.Contains(s_retrievalLockingStatusCode) && DatabaseDateBeforeUpdate >= s_retrievalLockingDate)
                 {
                     CurrentStatus = ReportStatusCode.NoUpdateAvailable;
                     return;
@@ -323,7 +324,7 @@ public partial class Report
             }
             else
             {
-                s_ceilingDateForRetrievalPermission = DatabaseDateBeforeUpdate;
+                s_retrievalLockingDate = DatabaseDateBeforeUpdate;
             }
         }
 
@@ -363,14 +364,15 @@ public partial class Report
                     if (QueriedReport == ReportType.Disaggregated && iceData != null && iceData.Any())
                     {
                         try
-                        {
+                        {   // Make an attempt to upload ICE data.
                             UploadToDatabase(fieldInfoPerEditedName: s_iceColumnMap!, dataToUpload: iceData, uploadingIceData: true);
                         }
                         catch (Exception e)
-                        {   // ICE is low priority.
+                        {   // ICE is low priority so just print the error.
                             Console.WriteLine(e);
                         }
                     }
+                    // Make an attempt to upload CFTC data.
                     UploadToDatabase(fieldInfoPerEditedName: cftcFieldInfoByEditedName, dataToUpload: cftcData, uploadingIceData: false, priceData: priceByDateByContractCode);
                 }
             }
@@ -387,7 +389,7 @@ public partial class Report
     }
 
     /// <summary>
-    /// Retrieves CFTC Commitments of Traders data if any data is more recent than the current value of <see cref="DatabaseDateBeforeUpdate"/>. 
+    /// Retrieves CFTC Commitments of Traders data if any data has a date value more recent than <see cref="DatabaseDateBeforeUpdate"/>. 
     /// </summary>
     /// <param name="maxRecordsPerLoop">Number used to limit the number of records retrieved from each loop attempt.</param>
     /// <param name="priceByDateByContractCode">Used to store null values for wanted price data.</param>
@@ -401,96 +403,86 @@ public partial class Report
     {
         // https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types
         const string WantedDataFormat = ".csv", MimeType = "text/csv";
-        int offsetCount = 0, totalRecordsToRetrieve = 0, recordsQueriedCount = 0;
+        int offsetCount = 0, remainingRecordsToRetrieve = 0;
         string[]? responseLines = null;
 
-        try
+        HttpHeaderValueCollection<MediaTypeWithQualityHeaderValue> acceptHeaders = s_cftcApiClient.DefaultRequestHeaders.Accept;
+        if (acceptHeaders.Count == 0)
         {
-            s_cftcApiClient.DefaultRequestHeaders.Accept.Clear();
-            s_cftcApiClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue(MimeType));
+            acceptHeaders.Add(new MediaTypeWithQualityHeaderValue(MimeType));
         }
-        catch (InvalidOperationException)
-        {// Properties can only be adjustted before a request has been made using s_cftcApiClient.
-        }
-
+        // List will contain records cleared for database upload.
         List<string[]> newCftcData = new();
+        // Dictionary will hold mapped FieldInfo instances for fields within the API and local database.
         Dictionary<string, FieldInfo?>? fieldInfoByEditedName = null;
-        do
+
+        string? response;
+        string comparisonOperator = DebugActive ? ">=" : ">";
+        // Make initial API call to find out how many new records are available. Executed only once.
+        var countRecordsUrl = $"{CftcApiCode}{WantedDataFormat}?$select=count(id)&$where=report_date_as_yyyy_mm_dd {comparisonOperator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'";
+        response = await s_cftcApiClient.GetStringAsync(countRecordsUrl).ConfigureAwait(false);
+
+        remainingRecordsToRetrieve = int.Parse(response.Split('\n')[1].Trim(s_charactersToTrim), NumberStyles.Number, null);
+
+        if (remainingRecordsToRetrieve == 0)
         {
-            string? response;
-            string comparisonOprator = DebugActive ? ">=" : ">";
-            // Make api call to find out how many new records are available.
-            // This section will only be run once.
-            if (totalRecordsToRetrieve == 0)
-            {
-                var countRecordsUrl = $"{CftcApiCode}{WantedDataFormat}?$select=count(id)&$where=report_date_as_yyyy_mm_dd {comparisonOprator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'";
-                response = await s_cftcApiClient.GetStringAsync(countRecordsUrl).ConfigureAwait(false);
+            CurrentStatus = ReportStatusCode.NoUpdateAvailable;
+        }
+        else if (DebugActive)
+        {
+            remainingRecordsToRetrieve = maxRecordsPerLoop;
+        }
 
-                totalRecordsToRetrieve = int.Parse(response.Split('\n')[1].Trim(s_charactersToTrim), NumberStyles.Number, null);
-
-                if (totalRecordsToRetrieve == 0)
-                {
-                    CurrentStatus = ReportStatusCode.NoUpdateAvailable;
-                    break;
-                }
-                else if (DebugActive)
-                {
-                    totalRecordsToRetrieve = maxRecordsPerLoop;
-                }
-                CurrentStatus = ReportStatusCode.AttemptingRetrieval;
-            }
-            string apiDetails = $"{CftcApiCode}{WantedDataFormat}?$where=report_date_as_yyyy_mm_dd{comparisonOprator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'&$order=id&$limit={maxRecordsPerLoop}&$offset={offsetCount++}";
+        while (remainingRecordsToRetrieve > 0)
+        {
+            CurrentStatus = ReportStatusCode.AttemptingRetrieval;
+            string apiDetails = $"{CftcApiCode}{WantedDataFormat}?$where=report_date_as_yyyy_mm_dd{comparisonOperator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'&$order=id&$limit={maxRecordsPerLoop}&$offset={offsetCount++}";
             response = await s_cftcApiClient.GetStringAsync(apiDetails).ConfigureAwait(false);
 
-            // Parse each line of the response and ensure that its date is valid and wanted.
-            if (response != null)
+            // Data from the API tends to have an extra line at the end so trim it.
+            responseLines = response.Trim('\n').Split('\n');
+            response = null;
+            // Subtract 1 to account for headers.
+            remainingRecordsToRetrieve -= responseLines.Length - 1;
+
+            fieldInfoByEditedName ??= MapHeaderFieldsToDatabase(externalHeaders: SplitOnCommaNotWithinQuotesRegex().Split(responseLines[0]), databaseFields: databaseFieldNames, iceHeaders: false);
+
+            int cftcDateColumn = (int)fieldInfoByEditedName[StandardDateFieldName]?.ColumnIndex!;
+            int cftcCodeColumn = (int)fieldInfoByEditedName[ContractCodeColumnName]?.ColumnIndex!;
+
+            // Start index at 1 rather than 0 to skip over headers.
+            for (var i = 1; i < responseLines.Length; ++i)
             {
-                // Data from the API tends to have an extra line at the end so trim it.
-                responseLines = response.Trim('\n').Split('\n');
-                response = null;
-                // Subtract 1 to account for headers.
-                recordsQueriedCount += responseLines.Length - 1;
-
-                fieldInfoByEditedName ??= MapHeaderFieldsToDatabase(externalHeaders: SplitOnCommaNotWithinQuotesRegex().Split(responseLines[0]), databaseFields: databaseFieldNames, iceHeaders: false);
-
-                int cftcDateColumn = (int)fieldInfoByEditedName[StandardDateFieldName]?.ColumnIndex!;
-                int cftcCodeColumn = (int)fieldInfoByEditedName[ContractCodeColumnName]?.ColumnIndex!;
-
-                // Start index at 1 rather than 0 to skip over headers.
-                for (var i = 1; i < responseLines.Length; ++i)
+                if (!string.IsNullOrEmpty(responseLines[i]))
                 {
-                    if (!string.IsNullOrEmpty(responseLines[i]))
-                    {
-                        string[] apiRecord = SplitOnCommaNotWithinQuotesRegex().Split(responseLines[i]).Select(x => x.Trim(s_charactersToTrim)).ToArray();
+                    string[] apiRecord = SplitOnCommaNotWithinQuotesRegex().Split(responseLines[i]).Select(x => x.Trim(s_charactersToTrim)).ToArray();
 
-                        if (DateTime.TryParseExact(apiRecord[cftcDateColumn], StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime parsedDate)
-                        && ((parsedDate > DatabaseDateBeforeUpdate && !DebugActive) || (parsedDate >= DatabaseDateBeforeUpdate && DebugActive)))
-                        {   // Create a null entry for the current combination of contract code and date within priceByDateByContractCode.
-                            if (IsLegacyCombined)
+                    if (DateTime.TryParseExact(apiRecord[cftcDateColumn], StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime parsedDate)
+                    && ((parsedDate > DatabaseDateBeforeUpdate && !DebugActive) || (parsedDate >= DatabaseDateBeforeUpdate && DebugActive)))
+                    {   // Create a null entry for the current combination of contract code and date within priceByDateByContractCode.
+                        if (IsLegacyCombined)
+                        {
+                            string currentContractCode = apiRecord[cftcCodeColumn];
+                            if (!priceByDateByContractCode.TryGetValue(currentContractCode, out Dictionary<DateTime, string?>? priceByDateForContractCode))
                             {
-                                string currentContractCode = apiRecord[cftcCodeColumn];
-                                if (!priceByDateByContractCode.TryGetValue(currentContractCode, out Dictionary<DateTime, string?>? priceByDateForContractCode))
-                                {
-                                    priceByDateForContractCode = priceByDateByContractCode[currentContractCode] = new();
-                                }
-                                priceByDateForContractCode.TryAdd(parsedDate, null);
+                                priceByDateForContractCode = priceByDateByContractCode[currentContractCode] = new();
                             }
-                            newCftcData.Add(apiRecord);
-                            if (parsedDate > DatabaseDateAfterUpdate) DatabaseDateAfterUpdate = parsedDate;
+                            priceByDateForContractCode.TryAdd(parsedDate, null);
                         }
+                        newCftcData.Add(apiRecord);
+                        if (parsedDate > DatabaseDateAfterUpdate) DatabaseDateAfterUpdate = parsedDate;
                     }
                 }
-                Array.Clear(responseLines);
             }
-        } while (recordsQueriedCount < totalRecordsToRetrieve);
-
+            responseLines = null;
+        };
         return (newCftcData, fieldInfoByEditedName);
     }
 
     /// <summary>
     /// Starts asynchronous tasks to download ICE contract data based on the value of <paramref name="mostRecentCftcDate"/>.
     /// </summary>
-    /// <param name="mostRecentCftcDate">The date value of the most recent data from the CFTC</param>
+    /// <param name="mostRecentCftcDate">The date value of the most recent data from the CFTC.</param>
     /// <param name="databaseFieldNames">Field names of the table data would be uploaded to.</param>
     /// <param name="debugReturnLimit">Number of rows to return if debugging this method.</param>
     /// <returns>An asynchronous task.</returns>
@@ -674,13 +666,19 @@ public partial class Report
                     string? fieldValue;
 
                     if (updatePrices && param.OleDbType.Equals(OleDbType.Currency))
-                    {    // Every row is guaranteed to have a corresponding DateTime.
-                        fieldValue = priceData![dataRow[cotCodeColumn]][DateTime.ParseExact(dataRow[cotDateColumn], StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None)];
+                    {
+                        try
+                        {   // Code is already set up to ensure that there is a value for every record. This ty block is for just in case an error happens somewhere else.
+                            fieldValue = priceData![dataRow[cotCodeColumn]][DateTime.ParseExact(dataRow[cotDateColumn], StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None)];
+                        }
+                        catch (KeyNotFoundException)
+                        {
+                            fieldValue = null;
+                        }
                     }
                     else
                     {
-                        int wantedIndex = (int)fieldInfoPerEditedName[param.ParameterName]?.ColumnIndex!;
-                        fieldValue = dataRow[wantedIndex];
+                        fieldValue = dataRow[(int)fieldInfoPerEditedName[param.ParameterName]?.ColumnIndex!];
                     }
 
                     if (string.IsNullOrEmpty(fieldValue)) param.Value = DBNull.Value;
@@ -692,7 +690,7 @@ public partial class Report
                             OleDbType.Currency or OleDbType.Decimal => decimal.Parse(fieldValue),
                             OleDbType.VarChar => fieldValue,
                             OleDbType.Date => DebugActive ? s_defaultStartDate : DateTime.ParseExact(fieldValue, StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None),
-                            _ => throw new ArgumentOutOfRangeException($"{nameof(param.OleDbType)} is unaccounted for: {param.OleDbType}.")
+                            _ => throw new ArgumentOutOfRangeException(nameof(fieldInfoPerEditedName), param.OleDbType, $"An unaccounted for OleDbType was encountered when accessing {param.ParameterName}.")
                         };
                     }
                 }
