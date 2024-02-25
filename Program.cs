@@ -37,19 +37,19 @@ if (OperatingSystem.IsWindows() && (args.Length == 2 || args.Length == 0))
     var filePathByReportType = JsonSerializer.Deserialize<Dictionary<string, string>>(databaseString)!;
     var priceSymbolByContractCode = JsonSerializer.Deserialize<Dictionary<string, string>>(priceString)!;
     /*
-    if (args.Length == 2)
-    {
-        foreach (var kvp in filePathByReportType)
+        if (args.Length == 2)
         {
-            Console.WriteLine(kvp.ToString());
-        }
+            foreach (var kvp in filePathByReportType)
+            {
+                Console.WriteLine(kvp.ToString());
+            }
 
-        foreach (var kvp in priceSymbolByContractCode)
-        {
-            Console.WriteLine(kvp.ToString());
+            foreach (var kvp in priceSymbolByContractCode)
+            {
+                Console.WriteLine(kvp.ToString());
+            }
+            Console.ReadKey();
         }
-        Console.ReadKey();
-    }
     */
     Dictionary<Report, Task> updatingTasks = new();
     bool testUpload = false;
@@ -84,43 +84,44 @@ if (OperatingSystem.IsWindows() && (args.Length == 2 || args.Length == 0))
         //if (debugMode) break;
     }
 
-    await Task.WhenAll(updatingTasks.Values);
-
+    try
+    {
+        await Task.WhenAll(updatingTasks.Values);
+    }
+    catch (Exception)
+    {
+        foreach (var task in updatingTasks.Values.Where(x => x.IsFaulted))
+        {
+            Console.WriteLine(task.Exception);
+        }
+    }
 #pragma warning disable CA1416 // Validate platform compatibility
-
-    bool updatePrices = false;
-    Report? legacyCombinedInstance = null;
 
     try
     {
-        legacyCombinedInstance = updatingTasks.Keys.First(x => x.IsLegacyCombined == true);
-        updatePrices = legacyCombinedInstance.SuccessfullyUpdated;
+        Report legacyCombinedInstance = updatingTasks.Keys.First(x => x.IsLegacyCombined == true);
+
+        var priceUpdatingTasks = (from instance in updatingTasks.Keys
+                                  where instance.AwaitingPriceUpdate
+                                  select instance.UpdatePricesWithLegacyDatabase(legacyCombinedInstance!)).ToList();
     }
     catch (InvalidOperationException)
-    {
+    { // Thrown if none of the keys have a IsLegacyCombined property equal to true.
     }
-    var priceUpdatingTasks = (from instance in updatingTasks.Keys
-                              where (instance.AwaitingPriceUpdate || updatePrices) && !instance.IsLegacyCombined
-                              select instance.UpdatePricesWithLegacyDatabase(legacyCombinedInstance!)).ToList();
 
 #pragma warning restore CA1416 // Validate platform compatibility
 
     totalElapsedTimeWatch.Stop();
-    Console.WriteLine("\n\nTotal Elapsed:\t" + (totalElapsedTimeWatch.ElapsedMilliseconds / 1000f) + 's');
-
     StringBuilder outputText = new();
+
     foreach (var (instance, retrievalTask) in updatingTasks)
     {
         instance.DisposeConnection();
         string baseText = $"{instance.QueriedReport}:{{Combined: {instance.RetrieveCombinedData}, Time Elapsed: {instance.ActionTimer.Elapsed.Milliseconds}ms, Latest Date: {instance.DatabaseDateAfterUpdate:yyyy-MM-dd}, Status: {(int)instance.CurrentStatus}}}";
         outputText.AppendLine(baseText);
-
-        if (retrievalTask.IsFaulted)
-        {
-            Console.WriteLine(retrievalTask.Exception?.InnerException?.ToString());
-        }
     }
-    await Console.Out.WriteAsync(outputText.ToString());
+    var elapsedTimeMessage = "\n\nTotal Elapsed:\t" + (totalElapsedTimeWatch.ElapsedMilliseconds / 1000f) + "s\n";
+    await Console.Out.WriteAsync(elapsedTimeMessage + outputText.ToString());
 }
 
 /// <summary>

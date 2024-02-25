@@ -6,6 +6,8 @@ using System.Data.OleDb;
 using System.Runtime.Versioning;
 using System.Text.RegularExpressions;
 using System.Globalization;
+//using System.Text.Json.Nodes;
+
 public enum ReportType
 {
     Legacy, Disaggregated, TFF
@@ -18,6 +20,21 @@ public enum ReportStatusCode
 [SupportedOSPlatform("windows")]
 public partial class Report
 {
+    /// <summary>
+    /// Standardized field name used for C.O.T date fields.
+    /// </summary>
+    private const string StandardDateFieldName = "report_date_as_yyyy_mm_dd";
+
+    /// <summary>
+    /// Standardized field name for C.O.T contract code fields.
+    /// </summary>
+    private const string ContractCodeColumnName = "cftc_contract_market_code";
+
+    /// <summary>
+    /// Standardized date format used to parse CFTC dates or to convert ICE dates.
+    /// </summary>
+    private const string StandardDateFormat = "yyyy-MM-ddTHH:mm:ss.fff";
+
     /// <summary>
     /// Gets or sets an enum that represnts the current state of the instance.
     /// </summary>
@@ -39,19 +56,29 @@ public partial class Report
     private ReportStatusCode _currentStatus;
 
     /// <summary>
-    /// Standardized field name used for C.O.T date fields.
+    /// File path to the database associaed with the current value of <see cref="QueriedReport"/>.
     /// </summary>
-    private const string StandardDateFieldName = "report_date_as_yyyy_mm_dd";
+    private readonly string _microsoftAccessDatabasePath;
 
     /// <summary>
-    /// Standardized field name for C.O.T contract code fields.
+    /// The table name to target within the database located at <see cref="_microsoftAccessDatabasePath"/>.
     /// </summary>
-    private const string ContractCodeColumnName = "cftc_contract_market_code";
+    private readonly string _tableNameWithinDatabase;
 
     /// <summary>
-    /// Standardized date format used to parse CFTC dates or to convert ICE dates.
+    /// Gets an identification code used to target the relevant CFTC API code.
     /// </summary>
-    private const string StandardDateFormat = "yyyy-MM-ddTHH:mm:ss.fff";
+    private readonly string _cftcApiCode;
+
+    /// <summary>
+    /// Field used to help determine if <see cref="AwaitingPriceUpdate"/> should return <see langword="true"/>.
+    /// </summary>
+    private bool _waitingForPriceUpdate = false;
+
+    /// <summary>
+    /// Number used to count how many threads are attempting to retrieve ICE data.
+    /// </summary>
+    private static int s_activeIceRetrievalCount = 0;
 
     /// <summary>
     /// DateTime returned when an instance for Legacy_Combined data queries the database for the most recent date.
@@ -80,12 +107,7 @@ public partial class Report
     private OleDbConnection DatabaseConnection => s_oleDbConnectionsByReportType[QueriedReport];
 
     /// <summary>
-    /// Number used to count how many threads are attempting to retrieve ICE data.
-    /// </summary>
-    private static int s_activeIceRetrievalCount = 0;
-
-    /// <summary>
-    /// Static variable to track changes done to LEgacy_Combined instances.
+    /// Static variable to track changes done to Legacy_Combined instances.
     /// </summary>
     /// <remarks>Used to escape waiting loop in RetrieveDataAsync for non Legacy Combined data.</remarks>
     private static ReportStatusCode s_retrievalLockingStatusCode = ReportStatusCode.NotInitialized;
@@ -94,17 +116,17 @@ public partial class Report
     /// Date before the inception of the Commitments of Traders Report.
     /// </summary>
     /// <value>An instance initialized to January 1, 1970.</value>
-    static readonly DateTime s_defaultStartDate = new(1970, 1, 1);
+    private static readonly DateTime s_defaultStartDate = new(1970, 1, 1);
 
     /// <summary>
     /// HttpClient used to query C.O.T API data.
     /// </summary>
-    static readonly HttpClient s_cftcApiClient = new() { BaseAddress = new Uri("https://publicreporting.cftc.gov/resource/") };
+    private static readonly HttpClient s_cftcApiClient = new() { BaseAddress = new Uri("https://publicreporting.cftc.gov/resource/") };
 
     /// <summary>
-    /// Connection string used to interface with SQL Server.
+    /// Connection string used to connect to the database located at <see cref="_microsoftAccessDatabasePath"/>.
     /// </summary> 
-    private string DatabaseConnectionString => "Provider=Microsoft.ACE.OLEDB.12.0;Data Source=" + DatabasePath + ';';
+    private string DatabaseConnectionString => "Provider=Microsoft.ACE.OLEDB.12.0;Data Source=" + _microsoftAccessDatabasePath + ';';
 
     /// <summary>
     ///  Gets a boolean value that represents if the current instance is Legacy Combined data.
@@ -113,25 +135,15 @@ public partial class Report
     public bool IsLegacyCombined { get; }
 
     /// <summary>
-    /// Gets an identification code used to target the relevant CFTC API code.
-    /// </summary>
-    private string CftcApiCode { get; }
-
-    /// <summary>
-    /// Gets a <see cref="ReportType"/> enum.
+    /// Gets the <see cref="ReportType"/> enum used to initialize the class.
     /// </summary>
     /// <value>An enum that specifies which Commitments of Traders Report this instance will target.</value>
     public ReportType QueriedReport { get; }
 
     /// <summary>
-    /// Gets a string representing the name of the table to target within <see cref="DatabasePath"/>.
-    /// </summary>
-    private string SqlTableDataName { get; }
-
-    /// <summary>
     /// Gets or sets a DateTime instance that represents the largest date available before data has been retrieved from the CFTC API.
     /// </summary>
-    /// <value>The largest date found within the relevant table with the database located at <see cref="DatabasePath"/>.</value>
+    /// <value>The largest date found within <see cref="_tableNameWithinDatabase"/> the database located at <see cref="_microsoftAccessDatabasePath"/>.</value>
     public DateTime DatabaseDateBeforeUpdate { get; private set; }
 
     /// <summary>
@@ -152,20 +164,10 @@ public partial class Report
     public bool SuccessfullyUpdated => CurrentStatus == ReportStatusCode.Updated;
 
     /// <summary>
-    /// Field used to help determine if <see cref="AwaitingPriceUpdate"/> should return <see langword="true"/>.
-    /// </summary>
-    private bool _waitingForPriceUpdate = false;
-
-    /// <summary>
     /// Gets a value that specifies if the current instance is tied to Futures + Options data.
     /// </summary>
     /// <value><see langword="true"/> if instance is dedicated to Futures + Options data; otherwise, <see langword="false"/> if designated for Futures only.</value>
     public bool RetrieveCombinedData { get; }
-
-    /// <summary>
-    /// Gets the file path to the database that data will be uploaded to.
-    /// </summary>
-    public string DatabasePath { get; }
 
     /// <summary>
     /// Gets a value used to toggle off or limit certain functionalities in this instance
@@ -221,6 +223,7 @@ public partial class Report
         /// Edited version of <see cref="ColumnName"/> 
         /// </summary>
         public string EditedColumnName { get; }
+
         /// <summary>
         /// Adjusts <see cref="ColumnName"/> so that it is database compatible.
         /// </summary>
@@ -240,7 +243,7 @@ public partial class Report
         /// </summary>
         /// <param name="editedDatabaseHeader">String used to determine what value should be returned.</param>
         /// <returns>An <see cref="OleDbType"/> that corresponds with the given header.</returns>
-        static private OleDbType CotFieldType(string editedDatabaseHeader)
+        static public OleDbType CotFieldType(string editedDatabaseHeader)
         {
             var intDesignator = new string[] { "all", "old", "other", "trader", "yymmdd" };
             return editedDatabaseHeader switch
@@ -259,12 +262,12 @@ public partial class Report
     /// </summary>
     /// <param name="queriedReport">A <see cref="ReportType"/> enum used to specify what sort of data should be retrieved with this instance.</param>
     /// <param name="retrieveCombinedData"><see langword="true"/> if Futures + Options data should be filtered for; otherwise, <see langword="false"/> for Futures Only data.</param>
-    /// <param name="databasePath">File path to database that data should be stored in.</param>
-    /// <exception cref="FileNotFoundException">Thrown if <paramref name="databasePath"/> cannot be found.</exception>
+    /// <param name="microsoftAccessDatabasePath">File path to database that data should be stored in.</param>
+    /// <exception cref="FileNotFoundException">Thrown if <paramref name="microsoftAccessDatabasePath"/> cannot be found.</exception>
     /// <exception cref="ArgumentOutOfRangeException">Thrown if an <paramref name="queriedReport"/> is out of range.</exception>
-    public Report(ReportType queriedReport, bool retrieveCombinedData, string databasePath, string tableName, bool useDebugMode = false)
+    public Report(ReportType queriedReport, bool retrieveCombinedData, string microsoftAccessDatabasePath, string tableNameWithinDatabase, bool useDebugMode = false)
     {
-        if (!File.Exists(databasePath)) throw new FileNotFoundException($"{nameof(databasePath)} doesn't exist.", databasePath);
+        if (!File.Exists(microsoftAccessDatabasePath)) throw new FileNotFoundException($"{nameof(microsoftAccessDatabasePath)} doesn't exist.", microsoftAccessDatabasePath);
         if (!new ReportType[] { ReportType.Legacy, ReportType.Disaggregated, ReportType.TFF }.Any(x => x.Equals(queriedReport)))
         {
             throw new ArgumentOutOfRangeException(nameof(queriedReport), queriedReport, "Unsupported ReportType detected.");
@@ -272,13 +275,18 @@ public partial class Report
 
         QueriedReport = queriedReport;
         RetrieveCombinedData = retrieveCombinedData;
-        DatabasePath = databasePath;
-        SqlTableDataName = tableName;
         DebugActive = useDebugMode;
         IsLegacyCombined = queriedReport == ReportType.Legacy && retrieveCombinedData;
-        CftcApiCode = s_apiIdentification[retrieveCombinedData][queriedReport];
 
-        s_oleDbConnectionsByReportType.TryAdd(queriedReport, new OleDbConnection(DatabaseConnectionString));
+        _microsoftAccessDatabasePath = microsoftAccessDatabasePath;
+        _tableNameWithinDatabase = tableNameWithinDatabase;
+        _cftcApiCode = s_apiIdentification[retrieveCombinedData][queriedReport];
+
+        var con = new OleDbConnection(DatabaseConnectionString);
+        if (!s_oleDbConnectionsByReportType.TryAdd(queriedReport, con))
+        {
+            con.Dispose();
+        }
     }
 
     /// <summary>
@@ -416,11 +424,10 @@ public partial class Report
         // Dictionary will hold mapped FieldInfo instances for fields within the API and local database.
         Dictionary<string, FieldInfo?>? fieldInfoByEditedName = null;
 
-        string? response;
         string comparisonOperator = DebugActive ? ">=" : ">";
         // Make initial API call to find out how many new records are available. Executed only once.
-        var countRecordsUrl = $"{CftcApiCode}{WantedDataFormat}?$select=count(id)&$where=report_date_as_yyyy_mm_dd {comparisonOperator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'";
-        response = await s_cftcApiClient.GetStringAsync(countRecordsUrl).ConfigureAwait(false);
+        var countRecordsUrl = $"{_cftcApiCode}{WantedDataFormat}?$select=count(id)&$where=report_date_as_yyyy_mm_dd {comparisonOperator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'";
+        string? response = await s_cftcApiClient.GetStringAsync(countRecordsUrl).ConfigureAwait(false);
 
         remainingRecordsToRetrieve = int.Parse(response.Split('\n')[1].Trim(s_charactersToTrim), NumberStyles.Number, null);
 
@@ -436,7 +443,7 @@ public partial class Report
         while (remainingRecordsToRetrieve > 0)
         {
             CurrentStatus = ReportStatusCode.AttemptingRetrieval;
-            string apiDetails = $"{CftcApiCode}{WantedDataFormat}?$where=report_date_as_yyyy_mm_dd{comparisonOperator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'&$order=id&$limit={maxRecordsPerLoop}&$offset={offsetCount++}";
+            string apiDetails = $"{_cftcApiCode}{WantedDataFormat}?$where=report_date_as_yyyy_mm_dd{comparisonOperator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'&$order=id&$limit={maxRecordsPerLoop}&$offset={offsetCount++}";
             response = await s_cftcApiClient.GetStringAsync(apiDetails).ConfigureAwait(false);
 
             // Data from the API tends to have an extra line at the end so trim it.
@@ -488,7 +495,7 @@ public partial class Report
     /// <returns>An asynchronous task.</returns>
     private async Task<List<string[]>?> IceCotRetrievalAsync(DateTime mostRecentCftcDate, List<string> databaseFieldNames, int debugReturnLimit = 1)
     {
-        DateTime maxIceDateInDatabase = await ReturnLatestDateInTableAsync(filterForIce: true);
+        DateTime maxIceDateInDatabase = await ReturnLatestDateInTableAsync(filterForIce: true).ConfigureAwait(false);
 
         if (QueriedReport != ReportType.Disaggregated || (maxIceDateInDatabase >= mostRecentCftcDate && !DebugActive)) return null;
 
@@ -541,7 +548,7 @@ public partial class Report
     /// Queries the International Continental Exchange website for Commitments of Traders data.
     /// </summary>
     /// <param name="iceCsvUrl">URL for the csv file to download.</param>
-    /// <param name="databaseHeaders">Headers from the Disaggregated report found within the database located at <see cref="DatabasePath"/>.</param>
+    /// <param name="databaseHeaders">Headers from the Disaggregated report found within the database located at <see cref="_microsoftAccessDatabasePath"/>.</param>
     /// <returns>A Date keyed dictionary containg a list of relevant rows.</returns>
     private static async Task<Dictionary<DateTime, List<string[]>>> QueryIceDataAsync(string iceCsvUrl, List<string> databaseHeaders, bool DebugActive)
     {
@@ -555,12 +562,12 @@ public partial class Report
         int iceShortDateColumn = 1;
 
         using var client = new HttpClient();
-        using HttpResponseMessage response = await client.GetAsync(iceCsvUrl);
+        using HttpResponseMessage response = await client.GetAsync(iceCsvUrl).ConfigureAwait(false);
         if (response.IsSuccessStatusCode)
         {
             bool foundHeaders = false;
             using HttpContent content = response.Content;
-            using var stream = (MemoryStream)await content.ReadAsStreamAsync();
+            using var stream = (MemoryStream)await content.ReadAsStreamAsync().ConfigureAwait(false);
             using var sr = new StreamReader(stream);
             int iceDateColumn = -1;
             const string IceShortDateFormat = "yyMMdd";
@@ -570,7 +577,7 @@ public partial class Report
 
                 try
                 {
-                    iceCsvRecord = SplitOnCommaNotWithinQuotesRegex().Split(await sr.ReadLineAsync() ?? throw new NullReferenceException("Empty iceCsvRecord"));
+                    iceCsvRecord = SplitOnCommaNotWithinQuotesRegex().Split(await sr.ReadLineAsync().ConfigureAwait(false) ?? throw new NullReferenceException("Empty iceCsvRecord"));
                 }
                 catch (NullReferenceException)
                 {
@@ -613,8 +620,7 @@ public partial class Report
     /// <exception cref="KeyNotFoundException">Thrown if an unknown key is used to access <paramref name="fieldInfoPerEditedName"/>.</exception>
     /// <exception cref="IndexOutOfRangeException">Thrown if a wanted index is out of bounds fora an array in <paramref name="dataToUpload"/>.</exception>
     /// <exception cref="OleDbException">Error related to database interaction.</exception>
-    /// <exception cref="ArgumentOutOfRangeException">Thrown if a field type is unaccounted for when assigning a value to a parameter.</exception>
-    /// <exception cref="ArgumentOutOfRangeException">Thrown if <paramref name="fieldInfoPerEditedName"/> contains 0 non-null values.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown if a field type is unaccounted for when assigning a value to a parameter or if <paramref name="fieldInfoPerEditedName"/> contains only null values.</exception>    
     /// <exception cref="InvalidOperationException">Thrown if an error occurs while attempting to comit a database transaction.</exception> 
     void UploadToDatabase(Dictionary<string, FieldInfo?> fieldInfoPerEditedName, List<string[]> dataToUpload, bool uploadingIceData, Dictionary<string, Dictionary<DateTime, string?>>? priceData = null)
     {
@@ -629,82 +635,85 @@ public partial class Report
 
         lock (DatabaseConnection)
         {
-            //try
-            //{
-            if (DatabaseConnection.State == System.Data.ConnectionState.Closed) DatabaseConnection.Open();
-
-            using OleDbCommand cmd = DatabaseConnection.CreateCommand();
-            Dictionary<string, char> paramaterizedCharByName = new();
-
-            foreach (FieldInfo? mappedColumn in fieldInfoPerEditedName.Values)
+            try
             {
-                if (mappedColumn is not null)
+                if (DatabaseConnection.State == System.Data.ConnectionState.Closed) DatabaseConnection.Open();
+
+                using OleDbCommand cmd = DatabaseConnection.CreateCommand();
+                Dictionary<string, char> paramaterizedCharByName = new();
+
+                foreach (FieldInfo? mappedColumn in fieldInfoPerEditedName.Values)
                 {
-                    cmd.Parameters.Add(new OleDbParameter(mappedColumn?.EditedColumnName, (OleDbType)mappedColumn?.ColumnType!) { IsNullable = true });
-                    paramaterizedCharByName.Add(mappedColumn?.DatabaseAdjustedName!, '?');
-                }
-            }
-
-            if (cmd.Parameters.Count == 0)
-            {
-                throw new ArgumentOutOfRangeException(nameof(fieldInfoPerEditedName), $"Command paramaterization failed. {nameof(fieldInfoPerEditedName)} doesn't contain non-null values.");
-            }
-
-            cmd.CommandText = $"INSERT INTO {SqlTableDataName} ({string.Join(',', paramaterizedCharByName.Keys)}) VALUES ({string.Join(',', paramaterizedCharByName.Values)});";
-            paramaterizedCharByName.Clear();
-
-            using OleDbTransaction transaction = DatabaseConnection.BeginTransaction();
-            cmd.Transaction = transaction;
-
-            int cotCodeColumn = (int)fieldInfoPerEditedName[ContractCodeColumnName]?.ColumnIndex!;
-            int cotDateColumn = (int)fieldInfoPerEditedName[StandardDateFieldName]?.ColumnIndex!;
-            // For each row of data, assign values to wanted parameters.         
-            foreach (string[] dataRow in dataToUpload)
-            {
-                foreach (OleDbParameter param in cmd.Parameters)
-                {
-                    string? fieldValue;
-
-                    if (updatePrices && param.OleDbType.Equals(OleDbType.Currency))
+                    if (mappedColumn is not null)
                     {
-                        try
-                        {   // Code is already set up to ensure that there is a value for every record. This ty block is for just in case an error happens somewhere else.
-                            fieldValue = priceData![dataRow[cotCodeColumn]][DateTime.ParseExact(dataRow[cotDateColumn], StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None)];
-                        }
-                        catch (KeyNotFoundException)
-                        {
-                            fieldValue = null;
-                        }
-                    }
-                    else
-                    {
-                        fieldValue = dataRow[(int)fieldInfoPerEditedName[param.ParameterName]?.ColumnIndex!];
-                    }
-
-                    if (string.IsNullOrEmpty(fieldValue)) param.Value = DBNull.Value;
-                    else
-                    {
-                        param.Value = param.OleDbType switch
-                        {
-                            OleDbType.Integer => int.Parse(fieldValue, NumberStyles.AllowThousands | NumberStyles.AllowLeadingSign),
-                            OleDbType.Currency or OleDbType.Decimal => decimal.Parse(fieldValue),
-                            OleDbType.VarChar => fieldValue,
-                            OleDbType.Date => DebugActive ? s_defaultStartDate : DateTime.ParseExact(fieldValue, StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None),
-                            _ => throw new ArgumentOutOfRangeException(nameof(fieldInfoPerEditedName), param.OleDbType, $"An unaccounted for OleDbType was encountered when accessing {param.ParameterName}.")
-                        };
+                        cmd.Parameters.Add(new OleDbParameter(mappedColumn?.EditedColumnName, (OleDbType)mappedColumn?.ColumnType!) { IsNullable = true });
+                        paramaterizedCharByName.Add(mappedColumn?.DatabaseAdjustedName!, '?');
                     }
                 }
-                cmd.ExecuteNonQuery();
-            }
-            transaction.Commit();
 
-            if (!(IsLegacyCombined || uploadingIceData)) _waitingForPriceUpdate = true;
-            CurrentStatus = ReportStatusCode.Updated;
-            //}
-            /*finally
+                if (cmd.Parameters.Count == 0)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(fieldInfoPerEditedName), $"Command paramaterization failed. {nameof(fieldInfoPerEditedName)} doesn't contain non-null values.");
+                }
+
+                cmd.CommandText = $"INSERT INTO {_tableNameWithinDatabase} ({string.Join(',', paramaterizedCharByName.Keys)}) VALUES ({string.Join(',', paramaterizedCharByName.Values)});";
+                paramaterizedCharByName.Clear();
+
+                using OleDbTransaction transaction = DatabaseConnection.BeginTransaction();
+                cmd.Transaction = transaction;
+
+                int cotCodeColumn = (int)fieldInfoPerEditedName[ContractCodeColumnName]?.ColumnIndex!;
+                int cotDateColumn = (int)fieldInfoPerEditedName[StandardDateFieldName]?.ColumnIndex!;
+                // For each row of data, assign values to wanted parameters.         
+                foreach (string[] dataRow in dataToUpload)
+                {
+                    foreach (OleDbParameter param in cmd.Parameters)
+                    {
+                        string? fieldValue;
+
+                        if (updatePrices && param.OleDbType.Equals(OleDbType.Currency))
+                        {
+                            try
+                            {   // Code is already set up to ensure that there is a value for every record. This ty block is for just in case an error happens somewhere else.
+                                fieldValue = priceData![dataRow[cotCodeColumn]][DateTime.ParseExact(dataRow[cotDateColumn], StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None)];
+                            }
+                            catch (KeyNotFoundException)
+                            {
+                                fieldValue = null;
+                            }
+                        }
+                        else
+                        {
+                            fieldValue = dataRow[(int)fieldInfoPerEditedName[param.ParameterName]?.ColumnIndex!];
+                        }
+
+                        if (string.IsNullOrEmpty(fieldValue))
+                        {
+                            param.Value = DBNull.Value;
+                        }
+                        else
+                        {
+                            param.Value = param.OleDbType switch
+                            {
+                                OleDbType.Integer => int.Parse(fieldValue, NumberStyles.AllowThousands | NumberStyles.AllowLeadingSign),
+                                OleDbType.Currency or OleDbType.Decimal => decimal.Parse(fieldValue),
+                                OleDbType.VarChar => fieldValue,
+                                OleDbType.Date => DebugActive ? s_defaultStartDate : DateTime.ParseExact(fieldValue, StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None),
+                                _ => throw new ArgumentOutOfRangeException(nameof(fieldInfoPerEditedName), param.OleDbType, $"An unaccounted for OleDbType was encountered when accessing {param.ParameterName}.")
+                            };
+                        }
+                    }
+                    cmd.ExecuteNonQuery();
+                }
+                transaction.Commit();
+
+                if (!(IsLegacyCombined || uploadingIceData)) _waitingForPriceUpdate = true;
+                CurrentStatus = ReportStatusCode.Updated;
+            }
+            finally
             {
                 DatabaseConnection.Close();
-            }*/
+            }
         }
     }
 
@@ -716,13 +725,11 @@ public partial class Report
     /// <returns>An asynchronous task.</returns>
     static async Task RetrieveYahooPriceDataAsync(Dictionary<string, string> yahooPriceSymbolByContractCode, Dictionary<string, Dictionary<DateTime, string?>> priceByDateByContractCode)
     {
-        const string BaseUrl = "https://query1.finance.yahoo.com/v7/finance/download/";
-
-        using HttpClient priceRetrievalClient = new() { BaseAddress = new Uri(BaseUrl) };
+        using HttpClient priceRetrievalClient = new() { BaseAddress = new Uri("https://query1.finance.yahoo.com/v7/finance/download/") };
         priceRetrievalClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("text/csv"));
 
         const byte YahooDateColumn = 0, YahooCloseColumn = 5;
-
+        // int httpRequestExceptionCount = 0, httpAttemptCount = 0;
         foreach (var knownSymbol in yahooPriceSymbolByContractCode)
         {
             if (priceByDateByContractCode.TryGetValue(knownSymbol.Key, out Dictionary<DateTime, string?>? wantedPrices))
@@ -735,11 +742,13 @@ public partial class Report
 
                 try
                 {
+                    //++httpAttemptCount;
                     response = await priceRetrievalClient.GetStringAsync(urlDetails).ConfigureAwait(false);
                 }
                 catch (HttpRequestException)
                 {
-                    //retrievalFailures.Add($"Failed to retrieve data for {knownSymbol.Key} with Symbol:{knownSymbol.Value}");
+                    // Console.WriteLine(e.StatusCode);
+                    // ++httpRequestExceptionCount;
                     continue;
                 }
                 string[] queriedResults = response.Trim(s_charactersToTrim).Split('\n');
@@ -754,10 +763,11 @@ public partial class Report
                 }
             }
         }
+        //if (httpRequestExceptionCount ==httpAttemptCount ) throw new HttpRequestException()
     }
 
     /// <summary>
-    /// Queries the database for the latest date found within <see cref="SqlTableDataName"/> .
+    /// Queries the database for the latest date found within <see cref="_tableNameWithinDatabase"/> .
     /// </summary>
     /// <param name="filterForIce"><see langword="true"/> if the latest date for ICE data should be returned; otherwise, <see langword="false"/>.</param>
     /// <returns>The most recent DateTime found within the database.</returns>
@@ -769,7 +779,7 @@ public partial class Report
 
         const string IceCodes = "('B','Cocoa','G','RC','Wheat','W')";
 
-        cmd.CommandText = $"SELECT MAX([Report_Date_as_YYYY-MM-DD]) FROM {SqlTableDataName} Where CFTC_Contract_Market_Code {(filterForIce ? string.Empty : "NOT ")}In {IceCodes};";
+        cmd.CommandText = $"SELECT MAX([Report_Date_as_YYYY-MM-DD]) FROM {_tableNameWithinDatabase} Where CFTC_Contract_Market_Code {(filterForIce ? string.Empty : "NOT ")}In {IceCodes};";
         DateTime storedDate = s_defaultStartDate;
 
         try
@@ -799,51 +809,52 @@ public partial class Report
     {
         if (!legacyCombinedInstance.IsLegacyCombined) throw new ArgumentOutOfRangeException(nameof(legacyCombinedInstance), "Must use Legacy Combined instance to update.");
 
-        string sqlCommand = @$"Update {SqlTableDataName} as T
-                             INNER JOIN [{legacyCombinedInstance.DatabasePath}].{legacyCombinedInstance.SqlTableDataName} as Source_TBL
+        string sqlCommand = @$"Update {_tableNameWithinDatabase} as T
+                             INNER JOIN [{legacyCombinedInstance._microsoftAccessDatabasePath}].{legacyCombinedInstance._tableNameWithinDatabase} as Source_TBL
                              ON Source_TBL.[Report_Date_as_YYYY-MM-DD]=T.[Report_Date_as_YYYY-MM-DD] AND Source_TBL.[CFTC_Contract_Market_Code]=T.[CFTC_Contract_Market_Code]
                              SET T.[Price] = Source_TBL.[Price] WHERE T.[Report_Date_as_YYYY-MM-DD] > ?;";// AND Source_TBL.[Price] IS NOT ?;";
 
-        using OleDbCommand cmd = DatabaseConnection.CreateCommand();
+        using var con = new OleDbConnection(DatabaseConnectionString);
+        using OleDbCommand cmd = con.CreateCommand();
         cmd.CommandText = sqlCommand;
         cmd.Parameters.AddWithValue("@GreaterThanDate", DatabaseDateBeforeUpdate);
         // cmd.Parameters.AddWithValue("nullPrice", DBNull.Value);
 
-        lock (DatabaseConnection)
+        //lock (DatabaseConnection)
+        //{
+        try
         {
-            try
-            {
-                if (DatabaseConnection.State == System.Data.ConnectionState.Closed) DatabaseConnection.Open();
-                cmd.ExecuteNonQuery();
-                _waitingForPriceUpdate = false;
-            }
-            catch (Exception e)
-            {
-                Console.WriteLine(e.ToString());
-                return false;
-            }
-            /*finally
-            {
-                DatabaseConnection.Close();
-            }*/
+            if (con.State == System.Data.ConnectionState.Closed) con.Open();
+            cmd.ExecuteNonQuery();
+            _waitingForPriceUpdate = false;
         }
+        catch (Exception e)
+        {
+            Console.WriteLine(e.ToString());
+            return false;
+        }
+        finally
+        {
+            con.Close();
+        }
+        //}
         return true;
     }
 
     /// <summary>
-    /// Queries the database for the field names found within the <see cref="SqlTableDataName"/> table.
+    /// Queries the database for the field names found within the <see cref="_tableNameWithinDatabase"/> table.
     /// </summary>
     /// <returns>A list of field names found within the database.</returns>
     async Task<List<string>> QueryDatabaseFieldNamesAsync()
     {
         List<string> fieldNames = new();
         //lock (DatabaseConnection)
-        //{
+        using var con = new OleDbConnection(DatabaseConnectionString);
         try
         {
-            if (DatabaseConnection.State == System.Data.ConnectionState.Closed) DatabaseConnection.Open();
-            using OleDbCommand cmd = DatabaseConnection.CreateCommand();
-            cmd.CommandText = $"SELECT TOP 1 * FROM {SqlTableDataName};";
+            if (con.State == System.Data.ConnectionState.Closed) await con.OpenAsync();
+            using OleDbCommand cmd = con.CreateCommand();
+            cmd.CommandText = $"SELECT TOP 1 * FROM {_tableNameWithinDatabase};";
 
             using var reader = await cmd.ExecuteReaderAsync();
 
@@ -863,6 +874,7 @@ public partial class Report
         {
             //Console.WriteLine(fieldNames.Count);
             //DatabaseConnection.Close();
+            await con.CloseAsync();
         }
         //}
         return fieldNames;
@@ -1013,6 +1025,33 @@ public partial class Report
         }
         return fieldInfoByEditedName;
     }
+    /*
+        /// <summary>
+        /// Queries the CFTC API and filters for the displayed headers.
+        /// </summary>
+        /// <returns>An asynchronous task.</returns>
+        private async Task<List<string>> GetHeadersFromAPI()
+        {
+            var apiMetaDataUri = new Uri($"https://publicreporting.cftc.gov/api/views/");
+            using var client = new HttpClient() { BaseAddress = apiMetaDataUri };
+            string jsonResponse = await client.GetStringAsync(_cftcApiCode).ConfigureAwait(false);
+
+            var document = JsonNode.Parse(jsonResponse)!;
+            JsonNode root = document.Root;
+            JsonArray columnInfo = root["columns"]!.AsArray();
+
+            var listOfFields = (from column in columnInfo
+                                where !column["fieldName"]!.Equals("id")
+                                select column["name"]?.ToString().ToLower().Replace(' ','_')!.ToList();
+
+            return listOfFields;
+        }
+        private void CreateDatabase()
+        {
+            var cat = new ADOX.Catalog();
+            cat.Create(DatabaseConnectionString);
+        }
+    */
 
     [GeneratedRegex("[,]{1}(?=(?:[^\"]*\"[^\"]*\")*(?![^\"]*\"))")]
     private static partial Regex SplitOnCommaNotWithinQuotesRegex();
