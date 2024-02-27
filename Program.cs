@@ -96,7 +96,6 @@ if (OperatingSystem.IsWindows() && (args.Length == 2 || args.Length == 0))
         }
     }
 #pragma warning disable CA1416 // Validate platform compatibility
-
     try
     {
         Report legacyCombinedInstance = updatingTasks.Keys.First(x => x.IsLegacyCombined == true);
@@ -108,7 +107,6 @@ if (OperatingSystem.IsWindows() && (args.Length == 2 || args.Length == 0))
     catch (InvalidOperationException)
     { // Thrown if none of the keys have a IsLegacyCombined property equal to true.
     }
-
 #pragma warning restore CA1416 // Validate platform compatibility
 
     totalElapsedTimeWatch.Stop();

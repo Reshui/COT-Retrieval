@@ -268,9 +268,10 @@ public partial class Report
     public Report(ReportType queriedReport, bool retrieveCombinedData, string microsoftAccessDatabasePath, string tableNameWithinDatabase, bool useDebugMode = false)
     {
         if (!File.Exists(microsoftAccessDatabasePath)) throw new FileNotFoundException($"{nameof(microsoftAccessDatabasePath)} doesn't exist.", microsoftAccessDatabasePath);
+
         if (!new ReportType[] { ReportType.Legacy, ReportType.Disaggregated, ReportType.TFF }.Any(x => x.Equals(queriedReport)))
         {
-            throw new ArgumentOutOfRangeException(nameof(queriedReport), queriedReport, "Unsupported ReportType detected.");
+            throw new ArgumentOutOfRangeException(nameof(queriedReport), queriedReport, $"Unsupported {nameof(ReportType)} detected.");
         }
 
         QueriedReport = queriedReport;
@@ -336,10 +337,9 @@ public partial class Report
             }
         }
 
-        int queryReturnLimit = DebugActive ? 1 : 20_000;
-
         try
         {
+            int queryReturnLimit = DebugActive ? 1 : 20_000;
             // Headers from local database.
             List<string> databaseFieldNames = await QueryDatabaseFieldNamesAsync().ConfigureAwait(false);
             // Dictionary to keep track of wanted date and contract code combinations. 
@@ -369,11 +369,11 @@ public partial class Report
 
                 if (!DebugActive || testUpload)
                 {
-                    if (QueriedReport == ReportType.Disaggregated && iceData != null && iceData.Any())
+                    if (QueriedReport == ReportType.Disaggregated && iceData != null && s_iceColumnMap != null && iceData.Any())
                     {
                         try
                         {   // Make an attempt to upload ICE data.
-                            UploadToDatabase(fieldInfoPerEditedName: s_iceColumnMap!, dataToUpload: iceData, uploadingIceData: true);
+                            UploadToDatabase(fieldInfoPerEditedName: s_iceColumnMap, dataToUpload: iceData, uploadingIceData: true);
                         }
                         catch (Exception e)
                         {   // ICE is low priority so just print the error.
@@ -614,8 +614,7 @@ public partial class Report
     /// <param name="fieldInfoPerEditedName">Dictionary that maps column names within the database to the equivalent column index within an array in <paramref name="dataToUpload"/>.</param>
     /// <param name="dataToUpload">A list of string arrays that data will be pulled from and uploaded to the database.</param>
     /// <param name="priceData">Dictionary of price information only supplied when <see cref="IsLegacyCombined"/> equals <see langword="true"/>.</param>
-    /// <param name="uploadingIceData"><see langword="true"/> if uploading ICE data; otherwise, <see langword="false"/> for CFTC data.</param>  
-    /// <returns><see langword="true"/> if date was successfully uploaded; otherwise, <see langword="false"/>.</returns>
+    /// <param name="uploadingIceData"><see langword="true"/> if uploading ICE data; otherwise, <see langword="false"/> for CFTC data.</param>   
     /// <remarks>Method isn't asynchronous because attempts to use the same <see cref="DatabaseConnection"/> instance from different threads will result in an error.</remarks>
     /// <exception cref="KeyNotFoundException">Thrown if an unknown key is used to access <paramref name="fieldInfoPerEditedName"/>.</exception>
     /// <exception cref="IndexOutOfRangeException">Thrown if a wanted index is out of bounds fora an array in <paramref name="dataToUpload"/>.</exception>
@@ -784,17 +783,12 @@ public partial class Report
 
         try
         {
-            if (con.State == System.Data.ConnectionState.Closed) con.Open();
+            if (con.State == System.Data.ConnectionState.Closed) await con.OpenAsync().ConfigureAwait(false);
             storedDate = ((DateTime?)await cmd.ExecuteScalarAsync().ConfigureAwait(false)) ?? s_defaultStartDate;
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine(e);
-            throw;
         }
         finally
         {
-            con.Close();
+            await con.CloseAsync();
         }
 
         return storedDate;
@@ -864,11 +858,6 @@ public partial class Report
                           select fieldName).ToList();
 
             await reader.CloseAsync();
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine(e);
-            throw;
         }
         finally
         {
