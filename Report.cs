@@ -6,6 +6,8 @@ using System.Data.OleDb;
 using System.Runtime.Versioning;
 using System.Text.RegularExpressions;
 using System.Globalization;
+using System.Diagnostics;
+
 //using System.Text.Json.Nodes;
 
 public enum ReportType
@@ -178,7 +180,8 @@ public partial class Report
     /// <summary>
     /// Timer used to time how long it takes to retrieve and upload data.
     /// </summary>
-    public readonly System.Diagnostics.Stopwatch ActionTimer = new();
+    public readonly Stopwatch ActionTimer = new();
+    private bool _mostRecentDateRetrieved = false;
 
     /// <summary>
     /// Dictionary used to access specific APIs related to COT data and keyed to whether or not Futures + Options data is wanted.
@@ -203,6 +206,8 @@ public partial class Report
     /// An array containing a white space and quote character.
     /// </summary>
     private readonly static char[] s_charactersToTrim = { ' ', '\"' };
+
+    public string Id { get => $"{QueriedReport.ToString()[0]}{(RetrieveCombinedData ? 'C' : 'F')}"; }
 
     public readonly struct FieldInfo
     {
@@ -305,40 +310,44 @@ public partial class Report
     /// <exception cref="ArgumentException"></exception>
     public async Task CommitmentsOfTradersRetrievalAndUploadAsync(Dictionary<string, string>? yahooPriceSymbolByContractCode, bool testUpload = false)
     {
-        if (!DebugActive && testUpload) throw new ArgumentException($"Cannot test upload if {nameof(DebugActive)} is false.");
-
-        ActionTimer.Start();
-        DatabaseDateBeforeUpdate = DatabaseDateAfterUpdate = await ReturnLatestDateInTableAsync(filterForIce: false).ConfigureAwait(false);
-        CurrentStatus = ReportStatusCode.CheckingDataAvailability;
-
-        if (!DebugActive)
-        {
-            // Wait until after the Legacy_Combined instance has attempted CFTC retrieval before continuing.
-            if (!IsLegacyCombined)
-            {
-                // Loop until a change in state is detected in the running Legacy Combined instance.
-                ActionTimer.Stop();
-                while (s_retrievalLockingStatusCode == ReportStatusCode.CheckingDataAvailability)
-                {
-                    await Task.Delay(300);
-                }
-
-                var failureCodes = new ReportStatusCode[] { ReportStatusCode.NoUpdateAvailable, ReportStatusCode.Failure };
-                if (failureCodes.Contains(s_retrievalLockingStatusCode) && DatabaseDateBeforeUpdate >= s_retrievalLockingDate)
-                {
-                    CurrentStatus = ReportStatusCode.NoUpdateAvailable;
-                    return;
-                }
-                ActionTimer.Start();
-            }
-            else
-            {
-                s_retrievalLockingDate = DatabaseDateBeforeUpdate;
-            }
-        }
-
         try
         {
+            if (!DebugActive && testUpload) throw new ArgumentException($"Cannot test upload if {nameof(DebugActive)} is false.");
+            ActionTimer.Start();
+            if (!_mostRecentDateRetrieved)
+            {
+                DatabaseDateBeforeUpdate = DatabaseDateAfterUpdate = await ReturnLatestDateInTableAsync(filterForIce: false).ConfigureAwait(false);
+                // DatabaseDateBeforeUpdate = DatabaseDateAfterUpdate = await Task.Run(() => ReturnLatestDateInTable(filterForIce: false)).ConfigureAwait(false);                
+                _mostRecentDateRetrieved = true;
+            }
+            CurrentStatus = ReportStatusCode.CheckingDataAvailability;
+
+            if (!DebugActive)
+            {
+                // Wait until after the Legacy_Combined instance has attempted CFTC retrieval before continuing.
+                if (!IsLegacyCombined)
+                {
+                    // Loop until a change in state is detected in the running Legacy Combined instance.
+                    ActionTimer.Stop();
+                    while (s_retrievalLockingStatusCode == ReportStatusCode.CheckingDataAvailability)
+                    {
+                        await Task.Delay(300).ConfigureAwait(false);
+                    }
+
+                    var failureCodes = new ReportStatusCode[] { ReportStatusCode.NoUpdateAvailable, ReportStatusCode.Failure };
+                    if (failureCodes.Contains(s_retrievalLockingStatusCode) && DatabaseDateBeforeUpdate >= s_retrievalLockingDate)
+                    {
+                        CurrentStatus = ReportStatusCode.NoUpdateAvailable;
+                        return;
+                    }
+                    ActionTimer.Start();
+                }
+                else
+                {
+                    s_retrievalLockingDate = DatabaseDateBeforeUpdate;
+                }
+            }
+
             int queryReturnLimit = DebugActive ? 1 : 20_000;
             // Headers from local database.
             List<string> databaseFieldNames = await QueryDatabaseFieldNamesAsync().ConfigureAwait(false);
@@ -364,7 +373,11 @@ public partial class Report
                         var keyResponse = Console.ReadKey(true);
                         if (keyResponse.Key != ConsoleKey.Y) retrievePrices = false;
                     }
-                    if (retrievePrices) await RetrieveYahooPriceDataAsync(yahooPriceSymbolByContractCode, priceByDateByContractCode).ConfigureAwait(false);
+
+                    if (retrievePrices)
+                    {
+                        await RetrieveYahooPriceDataAsync(yahooPriceSymbolByContractCode, priceByDateByContractCode).ConfigureAwait(false);
+                    }
                 }
 
                 if (!DebugActive || testUpload)
@@ -373,7 +386,7 @@ public partial class Report
                     {
                         try
                         {   // Make an attempt to upload ICE data.
-                            UploadToDatabase(fieldInfoPerEditedName: s_iceColumnMap, dataToUpload: iceData, uploadingIceData: true);
+                            await Task.Run(() => UploadToDatabase(fieldInfoPerEditedName: s_iceColumnMap, dataToUpload: iceData, uploadingIceData: true));
                         }
                         catch (Exception e)
                         {   // ICE is low priority so just print the error.
@@ -381,7 +394,7 @@ public partial class Report
                         }
                     }
                     // Make an attempt to upload CFTC data.
-                    UploadToDatabase(fieldInfoPerEditedName: cftcFieldInfoByEditedName, dataToUpload: cftcData, uploadingIceData: false, priceData: priceByDateByContractCode);
+                    await Task.Run(() => UploadToDatabase(fieldInfoPerEditedName: cftcFieldInfoByEditedName, dataToUpload: cftcData, uploadingIceData: false, priceData: priceByDateByContractCode));
                 }
             }
         }
@@ -427,6 +440,7 @@ public partial class Report
         string comparisonOperator = DebugActive ? ">=" : ">";
         // Make initial API call to find out how many new records are available. Executed only once.
         var countRecordsUrl = $"{_cftcApiCode}{WantedDataFormat}?$select=count(id)&$where=report_date_as_yyyy_mm_dd {comparisonOperator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'";
+
         string? response = await s_cftcApiClient.GetStringAsync(countRecordsUrl).ConfigureAwait(false);
 
         remainingRecordsToRetrieve = int.Parse(response.Split('\n')[1].Trim(s_charactersToTrim), NumberStyles.Number, null);
@@ -452,7 +466,7 @@ public partial class Report
             // Subtract 1 to account for headers.
             remainingRecordsToRetrieve -= responseLines.Length - 1;
 
-            fieldInfoByEditedName ??= MapHeaderFieldsToDatabase(externalHeaders: SplitOnCommaNotWithinQuotesRegex().Split(responseLines[0]), databaseFields: databaseFieldNames, iceHeaders: false);
+            fieldInfoByEditedName ??= MapHeaderFieldsToDatabase(externalHeaders: Regex.Split(responseLines[0], "[,]{1}(?=(?:[^\"]*\"[^\"]*\")*(?![^\"]*\"))"), databaseFields: databaseFieldNames, iceHeaders: false);
 
             int cftcDateColumn = (int)fieldInfoByEditedName[StandardDateFieldName]?.ColumnIndex!;
             int cftcCodeColumn = (int)fieldInfoByEditedName[ContractCodeColumnName]?.ColumnIndex!;
@@ -462,7 +476,7 @@ public partial class Report
             {
                 if (!string.IsNullOrEmpty(responseLines[i]))
                 {
-                    string[] apiRecord = SplitOnCommaNotWithinQuotesRegex().Split(responseLines[i]).Select(x => x.Trim(s_charactersToTrim)).ToArray();
+                    string[] apiRecord = Regex.Split(responseLines[i], "[,]{1}(?=(?:[^\"]*\"[^\"]*\")*(?![^\"]*\"))").Select(x => x.Trim(s_charactersToTrim)).ToArray();
 
                     if (DateTime.TryParseExact(apiRecord[cftcDateColumn], StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime parsedDate)
                     && ((parsedDate > DatabaseDateBeforeUpdate && !DebugActive) || (parsedDate >= DatabaseDateBeforeUpdate && DebugActive)))
@@ -577,7 +591,7 @@ public partial class Report
 
                 try
                 {
-                    iceCsvRecord = SplitOnCommaNotWithinQuotesRegex().Split(await sr.ReadLineAsync().ConfigureAwait(false) ?? throw new NullReferenceException("Empty iceCsvRecord"));
+                    iceCsvRecord = Regex.Split(await sr.ReadLineAsync().ConfigureAwait(false) ?? throw new NullReferenceException("Empty iceCsvRecord"), "[,]{1}(?=(?:[^\"]*\"[^\"]*\")*(?![^\"]*\"))");
                 }
                 catch (NullReferenceException)
                 {
@@ -772,28 +786,75 @@ public partial class Report
     /// <returns>The most recent DateTime found within the database.</returns>
     async Task<DateTime> ReturnLatestDateInTableAsync(bool filterForIce)
     {
-        if (filterForIce && QueriedReport != ReportType.Disaggregated) throw new InvalidOperationException($"{nameof(QueriedReport)} must be {nameof(ReportType.Disaggregated)} while {nameof(filterForIce)} is true.");
+        await Task.Delay(1000).ConfigureAwait(false);
+        if (filterForIce && QueriedReport != ReportType.Disaggregated)
+        {
+            throw new InvalidOperationException($"{nameof(QueriedReport)} must be {nameof(ReportType.Disaggregated)} while {nameof(filterForIce)} is true.");
+        }
+
         using var con = new OleDbConnection(DatabaseConnectionString);
         using OleDbCommand cmd = con.CreateCommand();
 
         const string IceCodes = "('B','Cocoa','G','RC','Wheat','W')";
-
         cmd.CommandText = $"SELECT MAX([Report_Date_as_YYYY-MM-DD]) FROM {_tableNameWithinDatabase} Where CFTC_Contract_Market_Code {(filterForIce ? string.Empty : "NOT ")}In {IceCodes};";
         DateTime storedDate = s_defaultStartDate;
 
         try
         {
-            if (con.State == System.Data.ConnectionState.Closed) await con.OpenAsync().ConfigureAwait(false);
-            storedDate = ((DateTime?)await cmd.ExecuteScalarAsync().ConfigureAwait(false)) ?? s_defaultStartDate;
+            if (DatabaseConnection.State == System.Data.ConnectionState.Closed)
+            {
+                await con.OpenAsync().ConfigureAwait(false);
+            }
+            var timer = Stopwatch.StartNew();
+            //var cmdResponse = await Task.Run(async () => await cmd.ExecuteScalarAsync()).ConfigureAwait(false);
+            //var cmdResponse = await Task.Run(() => cmd.ExecuteScalar());
+            Console.WriteLine(Id);
+            var cmdResponse = await cmd.ExecuteScalarAsync().ConfigureAwait(false);
+            timer.Stop();
+            Console.WriteLine($"{Id} Time to retrieve latest date: {timer.ElapsedMilliseconds} ms.");
+            storedDate = (DateTime?)cmdResponse ?? s_defaultStartDate;
         }
         finally
         {
-            await con.CloseAsync();
+            await con.CloseAsync().ConfigureAwait(false);
         }
-
         return storedDate;
     }
 
+    /// <summary>
+    /// Queries the database for the latest date found within <see cref="_tableNameWithinDatabase"/> .
+    /// </summary>
+    /// <param name="filterForIce"><see langword="true"/> if the latest date for ICE data should be returned; otherwise, <see langword="false"/>.</param>
+    /// <returns>The most recent DateTime found within the database.</returns>
+    DateTime ReturnLatestDateInTable(bool filterForIce)
+    {
+        if (filterForIce && QueriedReport != ReportType.Disaggregated) throw new InvalidOperationException($"{nameof(QueriedReport)} must be {nameof(ReportType.Disaggregated)} while {nameof(filterForIce)} is true.");
+        DateTime storedDate = s_defaultStartDate;
+
+        lock (DatabaseConnection)
+        {
+            Console.WriteLine(Id);
+            var timer = Stopwatch.StartNew();
+            using var con = new OleDbConnection(DatabaseConnectionString);
+            using OleDbCommand cmd = con.CreateCommand();
+
+            const string IceCodes = "('B','Cocoa','G','RC','Wheat','W')";
+            cmd.CommandText = $"SELECT MAX([Report_Date_as_YYYY-MM-DD]) FROM {_tableNameWithinDatabase} Where CFTC_Contract_Market_Code {(filterForIce ? string.Empty : "NOT ")}In {IceCodes};";
+
+            try
+            {
+                if (con.State == System.Data.ConnectionState.Closed) con.Open();
+                storedDate = (DateTime?)cmd.ExecuteScalar() ?? s_defaultStartDate;
+            }
+            finally
+            {
+                con.Close();
+            }
+            timer.Stop();
+            Console.WriteLine($"{Id} Time to get date, {timer.ElapsedMilliseconds}ms");
+        }
+        return storedDate;
+    }
     /// <summary>
     /// Asynchronously updates price data with stored data found in the legacy combined database.
     /// </summary>
@@ -846,24 +907,24 @@ public partial class Report
         using var con = new OleDbConnection(DatabaseConnectionString);
         try
         {
-            if (con.State == System.Data.ConnectionState.Closed) await con.OpenAsync();
+            if (con.State == System.Data.ConnectionState.Closed) await con.OpenAsync().ConfigureAwait(false);
             using OleDbCommand cmd = con.CreateCommand();
             cmd.CommandText = $"SELECT TOP 1 * FROM {_tableNameWithinDatabase};";
 
-            using var reader = await cmd.ExecuteReaderAsync();
+            using var reader = await cmd.ExecuteReaderAsync().ConfigureAwait(false);
 
             fieldNames = (from columnSchema in await reader.GetColumnSchemaAsync()
                           let fieldName = columnSchema.ColumnName
                           where fieldName.Equals("id", StringComparison.InvariantCultureIgnoreCase) == false
                           select fieldName).ToList();
 
-            await reader.CloseAsync();
+            await reader.CloseAsync().ConfigureAwait(false);
         }
         finally
         {
             //Console.WriteLine(fieldNames.Count);
             //DatabaseConnection.Close();
-            await con.CloseAsync();
+            await con.CloseAsync().ConfigureAwait(false);
         }
         //}
         return fieldNames;
@@ -1014,6 +1075,43 @@ public partial class Report
         }
         return fieldInfoByEditedName;
     }
+    /// <summary>
+    /// Queries the database for the most recent date and assigns the DatabaseDateBeforeUpdate
+    /// </summary>
+    /// <param name="availableReports"></param>    
+    public static void GetAllDates(List<Report> availableReports)
+    {
+        var commandToSend = new List<string>();
+        foreach (var report in availableReports)
+        {
+            commandToSend.Add($"Select '{report.Id}' as Name,MAX([Report_Date_as_YYYY-MM-DD]) From [{report._microsoftAccessDatabasePath}].{report._tableNameWithinDatabase}");
+        }
+
+        try
+        {
+            if (availableReports[0].DatabaseConnection.State == System.Data.ConnectionState.Closed)
+            {
+                availableReports[0].DatabaseConnection.Open();
+            }
+            using var cmd = availableReports[0].DatabaseConnection.CreateCommand();
+            cmd.CommandText = string.Join(" UNION ", commandToSend) + ';';
+            using var reader = cmd.ExecuteReader();
+
+            while (reader.Read())
+            {
+                var rowId = reader.GetString(0);
+                Report report = (from rp in availableReports
+                                 where rp.Id.Equals(rowId)
+                                 select rp).First();
+                report.DatabaseDateBeforeUpdate = report.DatabaseDateAfterUpdate = reader.GetDateTime(1);
+                report._mostRecentDateRetrieved = true;
+            }
+        }
+        finally
+        {
+            availableReports[0].DatabaseConnection.Close();
+        }
+    }
     /*
         /// <summary>
         /// Queries the CFTC API and filters for the displayed headers.
@@ -1041,10 +1139,8 @@ public partial class Report
             cat.Create(DatabaseConnectionString);
         }
     */
-
+    /*
     [GeneratedRegex("[,]{1}(?=(?:[^\"]*\"[^\"]*\")*(?![^\"]*\"))")]
     private static partial Regex SplitOnCommaNotWithinQuotesRegex();
+    */
 }
-
-
-

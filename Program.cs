@@ -1,15 +1,17 @@
 ﻿using ReportRetriever;
 using System.Text;
 using System.Text.Json;
+using System.Diagnostics;
 
-var totalElapsedTimeWatch = System.Diagnostics.Stopwatch.StartNew();
+var totalElapsedTimeWatch = Stopwatch.StartNew();
 bool debugMode = false;
 
 if (OperatingSystem.IsWindows() && (args.Length == 2 || args.Length == 0))
 {
+    Console.WriteLine($"Program started. {DateTime.UtcNow}\n");
     string databaseString;
     string priceString;
-
+    var symbolList = new StringBuilder();
     if (args.Length == 2)
     {
         if (debugMode) throw new InvalidOperationException($"{nameof(debugMode)} must be false to continue with command arguments");
@@ -22,18 +24,18 @@ if (OperatingSystem.IsWindows() && (args.Length == 2 || args.Length == 0))
         // When creating a string that will be parsed by the JsonSerializer 4 \ are needed for each \.  
         databaseString = $"{{\"Legacy\":{GenerateDefaultDatabasePath(ReportType.Legacy)},\"Disaggregated\":{GenerateDefaultDatabasePath(ReportType.Disaggregated)},\"TFF\":{GenerateDefaultDatabasePath(ReportType.TFF)}}}".Replace("\\", "\\\\");
 
-        priceString = "{\"191693\":\"AUP=F\",\"232741\":\"6A=F\",\"221602\":\"AW=F\",\"133741\":\"BTC=F\",\"00160F\":\"BWF=F\",\"102741\":\"6L=F\",\"06765T\":\"BZ=F\",\"096742\":\"6B=F\",\"050642\":\"CB=F\",\"090741\":\"6C=F\"" +
-            ",\"063642\":\"CSC=F\",\"052644\":\"GDK=F\",\"024656\":\"MTF=F\",\"073732\":\"CC=F\",\"083731\":\"KC=F\",\"06665T\":\"A8KZ23.NYM\",\"085692\":\"HG=F\",\"002602\":\"ZC=F\",\"033661\":\"CT=F\",\"12460+\":\"YM=F\"" +
-            ",\"124603\":\"YM=F\",\"124606\":\"RX=F\",\"052645\":\"DY=F\",\"239744\":\"RSV=F\",\"33874A\":\"EMD=F\",\"13874A\":\"ES=F\",\"138748\":\"XAP=F\",\"138749\":\"XAE=F\",\"13874C\":\"XAF=F\",\"13874E\":\"XAV=F\"" +
-            ",\"13874F\":\"XAI=F\",\"13874H\":\"XAB=F\",\"13874J\":\"XAU=F\",\"099741\":\"6E=F\",\"299741\":\"KGB=F\"" +
-            ",\"399741\":\"EURJPY=X\",\"132741\":\"GE=F\",\"045601\":\"ZQ=F\",\"061641\":\"GF=F\",\"040701\":\"OJ=F\",\"111659\":\"RB=F\",\"088691\":\"GC=F\",\"097741\":\"6J=F\",\"054642\":\"HE=F\",\"057642\":\"LE=F\"" +
-            ",\"095741\":\"6M=F\",\"124608\":\"MYM=F\",\"209747\":\"MNQ=F\",\"239747\":\"M2K=F\",\"13874U\":\"MES=F\",\"052641\":\"DC=F\",\"209742\":\"NQ=F\",\"20974+\":\"NQ=F\",\"023651\":\"NG=F\",\"240741\":\"NKD=F\"" +
-            ",\"240743\":\"NIY=F\",\"052642\":\"GN=F\",\"022651\":\"HO=F\",\"112741\":\"6N=F\",\"004603\":\"ZO=F\",\"075651\":\"PA=F\",\"076651\":\"PL=F\",\"058643\":\"LBS=F\",\"039601\":\"ZR=F\",\"239742\":\"RTY=F\"" +
-            ",\"089741\":\"6R=F\",\"43874A\":\"SDA=F\",\"13874+\":\"ES=F\",\"138741\":\"ES=F\",\"084691\":\"SI=F\",\"122741\":\"6Z=F\",\"026603\":\"ZM=F\",\"007601\":\"ZL=F\",\"005602\":\"ZS=F\",\"192651\":\"HRC=F\"" +
-            ",\"080732\":\"SB=F\",\"092741\":\"6S=F\",\"043607\":\"TN=F\",\"020604\":\"UB=F\",\"098662\":\"DX=F\",\"043602\":\"ZN=F\",\"042601\":\"ZT=F\",\"044601\":\"ZF=F\",\"020601\":\"ZB=F\",\"1170E1\":\"^VIX\"" +
-            ",\"001612\":\"KE=F\",\"001602\":\"ZW=F\",\"067651\":\"CL=F\",\"191691\":\"ALI=F\"}";
+        symbolList.Append("{\"191693\":\"AUP=F\",\"232741\":\"6A=F\",\"221602\":\"AW=F\",\"133741\":\"BTC=F\",\"00160F\":\"BWF=F\",\"102741\":\"6L=F\",\"06765T\":\"BZ=F\",\"096742\":\"6B=F\",\"050642\":\"CB=F\",\"090741\":\"6C=F\"");
+        symbolList.Append(",\"063642\":\"CSC=F\",\"052644\":\"GDK=F\",\"024656\":\"MTF=F\",\"073732\":\"CC=F\",\"083731\":\"KC=F\",\"06665T\":\"A8KZ23.NYM\",\"085692\":\"HG=F\",\"002602\":\"ZC=F\",\"033661\":\"CT=F\",\"12460+\":\"YM=F\"");
+        symbolList.Append(",\"124603\":\"YM=F\",\"124606\":\"RX=F\",\"052645\":\"DY=F\",\"239744\":\"RSV=F\",\"33874A\":\"EMD=F\",\"13874A\":\"ES=F\",\"138748\":\"XAP=F\",\"138749\":\"XAE=F\",\"13874C\":\"XAF=F\",\"13874E\":\"XAV=F\"");
+        symbolList.Append(",\"13874F\":\"XAI=F\",\"13874H\":\"XAB=F\",\"13874J\":\"XAU=F\",\"099741\":\"6E=F\",\"299741\":\"KGB=F\"");
+        symbolList.Append(",\"399741\":\"EURJPY=X\",\"132741\":\"GE=F\",\"045601\":\"ZQ=F\",\"061641\":\"GF=F\",\"040701\":\"OJ=F\",\"111659\":\"RB=F\",\"088691\":\"GC=F\",\"097741\":\"6J=F\",\"054642\":\"HE=F\",\"057642\":\"LE=F\"");
+        symbolList.Append(",\"095741\":\"6M=F\",\"124608\":\"MYM=F\",\"209747\":\"MNQ=F\",\"239747\":\"M2K=F\",\"13874U\":\"MES=F\",\"052641\":\"DC=F\",\"209742\":\"NQ=F\",\"20974+\":\"NQ=F\",\"023651\":\"NG=F\",\"240741\":\"NKD=F\"");
+        symbolList.Append(",\"240743\":\"NIY=F\",\"052642\":\"GN=F\",\"022651\":\"HO=F\",\"112741\":\"6N=F\",\"004603\":\"ZO=F\",\"075651\":\"PA=F\",\"076651\":\"PL=F\",\"058643\":\"LBS=F\",\"039601\":\"ZR=F\",\"239742\":\"RTY=F\"");
+        symbolList.Append(",\"089741\":\"6R=F\",\"43874A\":\"SDA=F\",\"13874+\":\"ES=F\",\"138741\":\"ES=F\",\"084691\":\"SI=F\",\"122741\":\"6Z=F\",\"026603\":\"ZM=F\",\"007601\":\"ZL=F\",\"005602\":\"ZS=F\",\"192651\":\"HRC=F\"");
+        symbolList.Append(",\"080732\":\"SB=F\",\"092741\":\"6S=F\",\"043607\":\"TN=F\",\"020604\":\"UB=F\",\"098662\":\"DX=F\",\"043602\":\"ZN=F\",\"042601\":\"ZT=F\",\"044601\":\"ZF=F\",\"020601\":\"ZB=F\",\"1170E1\":\"^VIX\"");
+        symbolList.Append(",\"001612\":\"KE=F\",\"001602\":\"ZW=F\",\"067651\":\"CL=F\",\"191691\":\"ALI=F\"}");
+        priceString = symbolList.ToString();
     }
-
     var filePathByReportType = JsonSerializer.Deserialize<Dictionary<string, string>>(databaseString)!;
     var priceSymbolByContractCode = JsonSerializer.Deserialize<Dictionary<string, string>>(priceString)!;
     /*
@@ -51,7 +53,6 @@ if (OperatingSystem.IsWindows() && (args.Length == 2 || args.Length == 0))
             Console.ReadKey();
         }
     */
-    Dictionary<Report, Task> updatingTasks = new();
     bool testUpload = false;
 
     if (debugMode)
@@ -67,40 +68,50 @@ if (OperatingSystem.IsWindows() && (args.Length == 2 || args.Length == 0))
         } while (!exitLoop);
     }
 
-    foreach (ReportType reportType in Enum.GetValues(typeof(ReportType)))
-    {
-        if (debugMode && reportType != ReportType.Legacy) continue;
+    var updatingTasksByReport = new Dictionary<Report, Task?>();
 
-        foreach (bool retrieveCombinedData in new bool[] { true, false })
+    foreach (bool retrieveCombinedData in new bool[] { true, false })
+    {
+        foreach (ReportType reportType in Enum.GetValues(typeof(ReportType)))
         {
+            if (debugMode && reportType != ReportType.Legacy) continue;
             if (filePathByReportType.TryGetValue(reportType.ToString(), out string? filePath) && File.Exists(filePath))
             {
                 var tableToTarget = $"{reportType}_{(retrieveCombinedData == true ? "Combined" : "Futures_Only")}";
                 var reportInstance = new Report(reportType, retrieveCombinedData, filePath, tableToTarget, debugMode);
-                updatingTasks.Add(reportInstance, reportInstance.CommitmentsOfTradersRetrievalAndUploadAsync(reportInstance.IsLegacyCombined ? priceSymbolByContractCode : null, testUpload));
+                updatingTasksByReport.Add(reportInstance, null);
+                // reportInstance.CommitmentsOfTradersRetrievalAndUploadAsync(reportInstance.IsLegacyCombined ? priceSymbolByContractCode : null, testUpload))
             }
             if (debugMode) break;
         }
         //if (debugMode) break;
     }
 
+    Report.GetAllDates(updatingTasksByReport.Keys.ToList());
+
+    foreach (var reportInstance in updatingTasksByReport.Keys)
+    {
+        updatingTasksByReport[reportInstance] = reportInstance.CommitmentsOfTradersRetrievalAndUploadAsync(reportInstance.IsLegacyCombined ? priceSymbolByContractCode : null, testUpload);
+    }
+
     try
     {
-        await Task.WhenAll(updatingTasks.Values);
+        await Task.WhenAll(updatingTasksByReport?.Values!);
     }
     catch (Exception)
     {
-        foreach (var task in updatingTasks.Values.Where(x => x.IsFaulted))
+        foreach (var task in updatingTasksByReport.Values.Where(x => x!.IsFaulted))
         {
-            Console.WriteLine(task.Exception);
+            Console.WriteLine(task!.Exception);
         }
     }
+
 #pragma warning disable CA1416 // Validate platform compatibility
     try
     {
-        Report legacyCombinedInstance = updatingTasks.Keys.First(x => x.IsLegacyCombined == true);
+        Report legacyCombinedInstance = updatingTasksByReport!.Keys.First(x => x.IsLegacyCombined == true);
 
-        var priceUpdatingTasks = (from instance in updatingTasks.Keys
+        var priceUpdatingTasks = (from instance in updatingTasksByReport.Keys
                                   where instance.AwaitingPriceUpdate
                                   select instance.UpdatePricesWithLegacyDatabase(legacyCombinedInstance!)).ToList();
     }
@@ -112,14 +123,16 @@ if (OperatingSystem.IsWindows() && (args.Length == 2 || args.Length == 0))
     totalElapsedTimeWatch.Stop();
     StringBuilder outputText = new();
 
-    foreach (var (instance, retrievalTask) in updatingTasks)
+    var elapsedTimeMessage = "\n\nTotal Elapsed:\t" + (totalElapsedTimeWatch.ElapsedMilliseconds / 1000f) + 's';
+    outputText.AppendLine(elapsedTimeMessage);
+
+    foreach (var instance in updatingTasksByReport!.Keys)
     {
         instance.DisposeConnection();
-        string baseText = $"{instance.QueriedReport}:{{Combined: {instance.RetrieveCombinedData}, Time Elapsed: {instance.ActionTimer.Elapsed.Milliseconds}ms, Latest Date: {instance.DatabaseDateAfterUpdate:yyyy-MM-dd}, Status: {(int)instance.CurrentStatus}}}";
+        string baseText = $"{instance.QueriedReport,-13}:{{Combined: {instance.RetrieveCombinedData,-5}, Time Elapsed: {instance.ActionTimer.ElapsedMilliseconds,-4}ms, Latest Date: {instance.DatabaseDateAfterUpdate:yyyy-MM-dd}, Status: {(int)instance.CurrentStatus}}}";
         outputText.AppendLine(baseText);
     }
-    var elapsedTimeMessage = "\n\nTotal Elapsed:\t" + (totalElapsedTimeWatch.ElapsedMilliseconds / 1000f) + "s\n";
-    await Console.Out.WriteAsync(elapsedTimeMessage + outputText.ToString());
+    await Console.Out.WriteAsync(outputText.ToString());
 }
 
 /// <summary>
