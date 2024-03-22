@@ -357,12 +357,12 @@ public partial class Report : IDisposable
             (List<string[]> cftcData, Dictionary<string, FieldInfo?>? cftcFieldInfoByEditedName) = await CftcCotRetrievalAsync(queryReturnLimit, priceByDateByContractCode, databaseFieldNames).ConfigureAwait(false);
 
             List<string[]>? iceData = null;
-            if (QueriedReport == ReportType.Disaggregated && cftcData.Any())
+            if (QueriedReport == ReportType.Disaggregated && cftcData.Count > 0)
             {
                 iceData = await IceCotRetrievalAsync(DatabaseDateAfterUpdate, databaseFieldNames, queryReturnLimit).ConfigureAwait(false);
             }
 
-            if (cftcData.Any() && cftcFieldInfoByEditedName is not null)
+            if (cftcData.Count > 0 && cftcFieldInfoByEditedName is not null)
             {   // Only retrieve price data for Legacy Combined instances since it encompases both Disaggregated and Traders in Financial Futures reports.
                 if (IsLegacyCombined && yahooPriceSymbolByContractCode != null && cftcFieldInfoByEditedName.ContainsKey("price"))
                 {
@@ -382,7 +382,7 @@ public partial class Report : IDisposable
 
                 if (!DebugActive || testUpload)
                 {
-                    if (QueriedReport == ReportType.Disaggregated && iceData != null && s_iceColumnMap != null && iceData.Any())
+                    if (QueriedReport == ReportType.Disaggregated && iceData != null && s_iceColumnMap != null && iceData.Count > 0)
                     {
                         try
                         {   // Make an attempt to upload ICE data.
