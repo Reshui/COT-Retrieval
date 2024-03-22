@@ -69,7 +69,7 @@ if (OperatingSystem.IsWindows() && (args.Length == 2 || args.Length == 0))
     }
 
     var updatingTasksByReport = new Dictionary<Report, Task?>();
-
+    bool getDatesViaAsync = false;
     foreach (bool retrieveCombinedData in new bool[] { true, false })
     {
         foreach (ReportType reportType in Enum.GetValues(typeof(ReportType)))
@@ -79,19 +79,21 @@ if (OperatingSystem.IsWindows() && (args.Length == 2 || args.Length == 0))
             {
                 var tableToTarget = $"{reportType}_{(retrieveCombinedData == true ? "Combined" : "Futures_Only")}";
                 var reportInstance = new Report(reportType, retrieveCombinedData, filePath, tableToTarget, debugMode);
-                updatingTasksByReport.Add(reportInstance, null);
-                // reportInstance.CommitmentsOfTradersRetrievalAndUploadAsync(reportInstance.IsLegacyCombined ? priceSymbolByContractCode : null, testUpload))
+                if (getDatesViaAsync) updatingTasksByReport.Add(reportInstance, reportInstance.CommitmentsOfTradersRetrievalAndUploadAsync(reportInstance.IsLegacyCombined ? priceSymbolByContractCode : null, testUpload));
+                else updatingTasksByReport.Add(reportInstance, null);
             }
             if (debugMode) break;
         }
         //if (debugMode) break;
     }
 
-    Report.GetAllDates(updatingTasksByReport.Keys.ToList());
-
-    foreach (var reportInstance in updatingTasksByReport.Keys)
+    if (!getDatesViaAsync)
     {
-        updatingTasksByReport[reportInstance] = reportInstance.CommitmentsOfTradersRetrievalAndUploadAsync(reportInstance.IsLegacyCombined ? priceSymbolByContractCode : null, testUpload);
+        Report.GetAllDates(updatingTasksByReport.Keys.ToList());
+        foreach (var reportInstance in updatingTasksByReport.Keys)
+        {
+            updatingTasksByReport[reportInstance] = reportInstance.CommitmentsOfTradersRetrievalAndUploadAsync(reportInstance.IsLegacyCombined ? priceSymbolByContractCode : null, testUpload);
+        }
     }
 
     try
@@ -128,7 +130,7 @@ if (OperatingSystem.IsWindows() && (args.Length == 2 || args.Length == 0))
 
     foreach (var instance in updatingTasksByReport!.Keys)
     {
-        instance.DisposeConnection();
+        instance.Dispose();
         string baseText = $"{instance.QueriedReport,-13}:{{Combined: {instance.RetrieveCombinedData,-5}, Time Elapsed: {instance.ActionTimer.ElapsedMilliseconds,-4}ms, Latest Date: {instance.DatabaseDateAfterUpdate:yyyy-MM-dd}, Status: {(int)instance.CurrentStatus}}}";
         outputText.AppendLine(baseText);
     }

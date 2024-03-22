@@ -20,7 +20,7 @@ public enum ReportStatusCode
 }
 
 [SupportedOSPlatform("windows")]
-public partial class Report
+public partial class Report : IDisposable
 {
     /// <summary>
     /// Standardized field name used for C.O.T date fields.
@@ -786,7 +786,6 @@ public partial class Report
     /// <returns>The most recent DateTime found within the database.</returns>
     async Task<DateTime> ReturnLatestDateInTableAsync(bool filterForIce)
     {
-        await Task.Delay(1000).ConfigureAwait(false);
         if (filterForIce && QueriedReport != ReportType.Disaggregated)
         {
             throw new InvalidOperationException($"{nameof(QueriedReport)} must be {nameof(ReportType.Disaggregated)} while {nameof(filterForIce)} is true.");
@@ -805,13 +804,9 @@ public partial class Report
             {
                 await con.OpenAsync().ConfigureAwait(false);
             }
-            var timer = Stopwatch.StartNew();
             //var cmdResponse = await Task.Run(async () => await cmd.ExecuteScalarAsync()).ConfigureAwait(false);
             //var cmdResponse = await Task.Run(() => cmd.ExecuteScalar());
-            Console.WriteLine(Id);
             var cmdResponse = await cmd.ExecuteScalarAsync().ConfigureAwait(false);
-            timer.Stop();
-            Console.WriteLine($"{Id} Time to retrieve latest date: {timer.ElapsedMilliseconds} ms.");
             storedDate = (DateTime?)cmdResponse ?? s_defaultStartDate;
         }
         finally
@@ -930,13 +925,17 @@ public partial class Report
         return fieldNames;
     }
 
-    /// <summary>
-    /// Disposes the OleDbConnection associated with this instance.
-    /// </summary>
-    public void DisposeConnection()
+    public void Dispose()
     {
-        if (DatabaseConnection.State == System.Data.ConnectionState.Open) DatabaseConnection.Close();
+        try
+        {
+            if (DatabaseConnection.State == System.Data.ConnectionState.Open) DatabaseConnection.Close();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
         DatabaseConnection.Dispose();
+        GC.SuppressFinalize(this);
     }
 
     /// <summary>
