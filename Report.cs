@@ -509,7 +509,8 @@ public partial class Report : IDisposable
     /// <returns>An asynchronous task.</returns>
     private async Task<List<string[]>?> IceCotRetrievalAsync(DateTime mostRecentCftcDate, List<string> databaseFieldNames, int debugReturnLimit = 1)
     {
-        DateTime maxIceDateInDatabase = await ReturnLatestDateInTableAsync(filterForIce: true).ConfigureAwait(false);
+        //DateTime maxIceDateInDatabase = await ReturnLatestDateInTableAsync(filterForIce: true).ConfigureAwait(false);
+        DateTime maxIceDateInDatabase = await Task.Run(() => ReturnLatestDateInTable(true)).ConfigureAwait(false);
 
         if (QueriedReport != ReportType.Disaggregated || (maxIceDateInDatabase >= mostRecentCftcDate && !DebugActive)) return null;
 
@@ -536,6 +537,7 @@ public partial class Report : IDisposable
                 }
             }
         }
+
         Interlocked.Decrement(ref s_activeIceRetrievalCount);
         // Given this methods async properties, 2 instances may be attempting to download ICE data at the same time.
         while (s_activeIceRetrievalCount > 0)
@@ -543,19 +545,33 @@ public partial class Report : IDisposable
             await Task.Delay(300);
         }
 
-        await Task.WhenAll(s_iceCsvRawData.Values!);
-        int futOrCombinedColumn = (int)s_iceColumnMap!["futonly_or_combined"]?.ColumnIndex!;
-        // Filter for data relevant to the current instance and is more recent than what is stored in the database.
-        var iceQuery = from kvp in s_iceCsvRawData
-                       let weeklyTaskLocated = kvp.Key.Equals(WeeklyIceKey)
-                       where ((singleWeekRetrieval && weeklyTaskLocated) || (!singleWeekRetrieval && !weeklyTaskLocated)) && !kvp.Value.IsFaulted
-                       from recordsByDateTime in kvp.Value.Result
-                       where (!DebugActive && recordsByDateTime.Key > maxIceDateInDatabase) || (DebugActive && recordsByDateTime.Key >= maxIceDateInDatabase)
-                       from row in recordsByDateTime.Value
-                       where row[futOrCombinedColumn].Equals(RetrieveCombinedData ? "combined" : "futonly", StringComparison.InvariantCultureIgnoreCase)
-                       select row;
+        try
+        {
+            await Task.WhenAll(s_iceCsvRawData.Values!);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine("Failed to retrieve at least 1 instance of ICE data.    " + e.Message);
+        }
 
-        return DebugActive ? iceQuery.Take(debugReturnLimit).ToList() : iceQuery.ToList();
+        try
+        {
+            int futOrCombinedColumn = (int)s_iceColumnMap!["futonly_or_combined"]?.ColumnIndex!;
+            // Filter for data relevant to the current instance and is more recent than what is stored in the database.
+            var iceQuery = from kvp in s_iceCsvRawData
+                           let weeklyTaskLocated = kvp.Key.Equals(WeeklyIceKey)
+                           where ((singleWeekRetrieval && weeklyTaskLocated) || (!singleWeekRetrieval && !weeklyTaskLocated)) && !kvp.Value.IsFaulted
+                           from recordsByDateTime in kvp.Value.Result
+                           where (!DebugActive && recordsByDateTime.Key > maxIceDateInDatabase) || (DebugActive && recordsByDateTime.Key >= maxIceDateInDatabase)
+                           from row in recordsByDateTime.Value
+                           where row[futOrCombinedColumn].Equals(RetrieveCombinedData ? "combined" : "futonly", StringComparison.InvariantCultureIgnoreCase)
+                           select row;
+            return DebugActive ? iceQuery.Take(debugReturnLimit).ToList() : iceQuery.ToList();
+        }
+        catch (Exception e) when (e is KeyNotFoundException or NullReferenceException)
+        {
+            return new List<string[]>();
+        }
     }
 
     /// <summary>
@@ -828,8 +844,6 @@ public partial class Report : IDisposable
 
         lock (DatabaseConnection)
         {
-            Console.WriteLine(Id);
-            var timer = Stopwatch.StartNew();
             using var con = new OleDbConnection(DatabaseConnectionString);
             using OleDbCommand cmd = con.CreateCommand();
 
@@ -845,8 +859,6 @@ public partial class Report : IDisposable
             {
                 con.Close();
             }
-            timer.Stop();
-            Console.WriteLine($"{Id} Time to get date, {timer.ElapsedMilliseconds}ms");
         }
         return storedDate;
     }
