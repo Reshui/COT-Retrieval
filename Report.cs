@@ -466,7 +466,7 @@ public partial class Report : IDisposable
             // Subtract 1 to account for headers.
             remainingRecordsToRetrieve -= responseLines.Length - 1;
 
-            fieldInfoByEditedName ??= MapHeaderFieldsToDatabase(externalHeaders: Regex.Split(responseLines[0], "[,]{1}(?=(?:[^\"]*\"[^\"]*\")*(?![^\"]*\"))"), databaseFields: databaseFieldNames, iceHeaders: false);
+            fieldInfoByEditedName ??= MapHeaderFieldsToDatabase(externalHeaders: MyRegex().Split(responseLines[0]), databaseFields: databaseFieldNames, iceHeaders: false);
 
             int cftcDateColumn = (int)fieldInfoByEditedName[StandardDateFieldName]?.ColumnIndex!;
             int cftcCodeColumn = (int)fieldInfoByEditedName[ContractCodeColumnName]?.ColumnIndex!;
@@ -476,7 +476,7 @@ public partial class Report : IDisposable
             {
                 if (!string.IsNullOrEmpty(responseLines[i]))
                 {
-                    string[] apiRecord = Regex.Split(responseLines[i], "[,]{1}(?=(?:[^\"]*\"[^\"]*\")*(?![^\"]*\"))").Select(x => x.Trim(s_charactersToTrim)).ToArray();
+                    string[] apiRecord = MyRegex().Split(responseLines[i]).Select(x => x.Trim(s_charactersToTrim)).ToArray();
 
                     if (DateTime.TryParseExact(apiRecord[cftcDateColumn], StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime parsedDate)
                     && ((parsedDate > DatabaseDateBeforeUpdate && !DebugActive) || (parsedDate >= DatabaseDateBeforeUpdate && DebugActive)))
@@ -607,7 +607,7 @@ public partial class Report : IDisposable
 
                 try
                 {
-                    iceCsvRecord = Regex.Split(await sr.ReadLineAsync().ConfigureAwait(false) ?? throw new NullReferenceException("Empty iceCsvRecord"), "[,]{1}(?=(?:[^\"]*\"[^\"]*\")*(?![^\"]*\"))");
+                    iceCsvRecord = MyRegex().Split(await sr.ReadLineAsync().ConfigureAwait(false) ?? throw new NullReferenceException("Empty iceCsvRecord"));
                 }
                 catch (NullReferenceException)
                 {
@@ -1123,33 +1123,36 @@ public partial class Report : IDisposable
             availableReports[0].DatabaseConnection.Close();
         }
     }
+
+    [GeneratedRegex("[,]{1}(?=(?:[^\"]*\"[^\"]*\")*(?![^\"]*\"))")]
+    private static partial Regex MyRegex();
     /*
-        /// <summary>
-        /// Queries the CFTC API and filters for the displayed headers.
-        /// </summary>
-        /// <returns>An asynchronous task.</returns>
-        private async Task<List<string>> GetHeadersFromAPI()
-        {
-            var apiMetaDataUri = new Uri($"https://publicreporting.cftc.gov/api/views/");
-            using var client = new HttpClient() { BaseAddress = apiMetaDataUri };
-            string jsonResponse = await client.GetStringAsync(_cftcApiCode).ConfigureAwait(false);
+/// <summary>
+/// Queries the CFTC API and filters for the displayed headers.
+/// </summary>
+/// <returns>An asynchronous task.</returns>
+private async Task<List<string>> GetHeadersFromAPI()
+{
+var apiMetaDataUri = new Uri($"https://publicreporting.cftc.gov/api/views/");
+using var client = new HttpClient() { BaseAddress = apiMetaDataUri };
+string jsonResponse = await client.GetStringAsync(_cftcApiCode).ConfigureAwait(false);
 
-            var document = JsonNode.Parse(jsonResponse)!;
-            JsonNode root = document.Root;
-            JsonArray columnInfo = root["columns"]!.AsArray();
+var document = JsonNode.Parse(jsonResponse)!;
+JsonNode root = document.Root;
+JsonArray columnInfo = root["columns"]!.AsArray();
 
-            var listOfFields = (from column in columnInfo
-                                where !column["fieldName"]!.Equals("id")
-                                select column["name"]?.ToString().ToLower().Replace(' ','_')!.ToList();
+var listOfFields = (from column in columnInfo
+where !column["fieldName"]!.Equals("id")
+select column["name"]?.ToString().ToLower().Replace(' ','_')!.ToList();
 
-            return listOfFields;
-        }
-        private void CreateDatabase()
-        {
-            var cat = new ADOX.Catalog();
-            cat.Create(DatabaseConnectionString);
-        }
-    */
+return listOfFields;
+}
+private void CreateDatabase()
+{
+var cat = new ADOX.Catalog();
+cat.Create(DatabaseConnectionString);
+}
+*/
     /*
     [GeneratedRegex("[,]{1}(?=(?:[^\"]*\"[^\"]*\")*(?![^\"]*\"))")]
     private static partial Regex SplitOnCommaNotWithinQuotesRegex();
