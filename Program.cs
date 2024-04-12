@@ -125,7 +125,9 @@ if (OperatingSystem.IsWindows() && (args.Length == 2 || args.Length == 0))
     totalElapsedTimeWatch.Stop();
     StringBuilder outputText = new();
 
-    var elapsedTimeMessage = "\n\nTotal Elapsed:\t" + (totalElapsedTimeWatch.ElapsedMilliseconds / 1000f) + 's';
+    var totalRunTime = TimeSpan.FromMilliseconds(totalElapsedTimeWatch.ElapsedMilliseconds);
+
+    var elapsedTimeMessage = "\n\nTotal Elapsed:\t" + totalRunTime.ToString("hh\\:mm\\:ss\\.ff");
     outputText.AppendLine(elapsedTimeMessage);
 
     foreach (var instance in updatingTasksByReport!.Keys)
