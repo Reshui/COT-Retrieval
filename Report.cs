@@ -86,7 +86,7 @@ public partial class Report : IDisposable
     /// DateTime returned when an instance for Legacy_Combined data queries the database for the most recent date.
     /// </summary>
     /// <remarks>Assigned a value in <see cref="CommitmentsOfTradersRetrievalAndUploadAsync"/></remarks>
-    private static DateTime s_retrievalLockingDate;
+    private static DateTime s_legacyCombinedDateBeforeApiQuery;
 
     /// <summary>
     /// Dictionary used to store downloaded ICE COT data regardless of <see cref="RetrieveCombinedData"/>'s value.
@@ -181,7 +181,10 @@ public partial class Report : IDisposable
     /// Timer used to time how long it takes to retrieve and upload data.
     /// </summary>
     public readonly Stopwatch ActionTimer = new();
-    private bool _mostRecentDateRetrieved = false;
+    /// <summary>
+    /// Gets or sets a boolean to show if the most recent date
+    /// </summary>
+    private bool _databaseQueriedForMostRecentDate = false;
 
     /// <summary>
     /// Dictionary used to access specific APIs related to COT data and keyed to whether or not Futures + Options data is wanted.
@@ -208,59 +211,6 @@ public partial class Report : IDisposable
     private readonly static char[] s_charactersToTrim = { ' ', '\"' };
 
     public string Id { get => $"{QueriedReport.ToString()[0]}{(RetrieveCombinedData ? 'C' : 'F')}"; }
-
-    public readonly struct FieldInfo
-    {
-        /// <summary>
-        /// Column Index of the given field within an array of data.
-        /// </summary>
-        public int ColumnIndex { get; }
-        /// <summary>
-        /// OleDbType assigned to the field based on the fields <see cref="EditedColumnName"/> property. 
-        /// </summary>
-        public OleDbType ColumnType { get; }
-        /// <summary>
-        /// Name of the field within the database.
-        /// </summary>
-        public string ColumnName { get; }
-
-        /// <summary>
-        /// Edited version of <see cref="ColumnName"/> 
-        /// </summary>
-        public string EditedColumnName { get; }
-
-        /// <summary>
-        /// Adjusts <see cref="ColumnName"/> so that it is database compatible.
-        /// </summary>
-        /// <value>Returns <see cref="ColumnName"/> enclosed in square brackets.</value>
-        public string DatabaseAdjustedName => $"[{ColumnName}]";
-
-        public FieldInfo(int columnIndex, string columnName, string editedColumnName)
-        {
-            ColumnIndex = columnIndex;
-            ColumnName = columnName;
-            EditedColumnName = editedColumnName;
-            ColumnType = CotFieldType(editedColumnName);
-        }
-
-        /// <summary>
-        /// Returns a <see cref="OleDbType"/> based on text within <paramref name="editedDatabaseHeader"/>.
-        /// </summary>
-        /// <param name="editedDatabaseHeader">String used to determine what value should be returned.</param>
-        /// <returns>An <see cref="OleDbType"/> that corresponds with the given header.</returns>
-        static public OleDbType CotFieldType(string editedDatabaseHeader)
-        {
-            var intDesignator = new string[] { "all", "old", "other", "trader", "yymmdd" };
-            return editedDatabaseHeader switch
-            {
-                string a when a.Contains("yyyy", StringComparison.InvariantCultureIgnoreCase) => OleDbType.Date,
-                string b when b.Contains("pct", StringComparison.InvariantCultureIgnoreCase) || b.Contains("conc", StringComparison.InvariantCultureIgnoreCase) => OleDbType.Decimal,
-                string c when intDesignator.Any(x => c.Contains(x, StringComparison.InvariantCultureIgnoreCase)) => OleDbType.Integer,
-                string d when d.Equals("price", StringComparison.InvariantCultureIgnoreCase) => OleDbType.Currency,
-                _ => OleDbType.VarChar
-            };
-        }
-    }
 
     /// <summary>
     /// Initializes a new instance of the Report class with the specified properties.
@@ -313,13 +263,16 @@ public partial class Report : IDisposable
         try
         {
             if (!DebugActive && testUpload) throw new ArgumentException($"Cannot test upload if {nameof(DebugActive)} is false.");
+
             ActionTimer.Start();
-            if (!_mostRecentDateRetrieved)
+
+            if (!_databaseQueriedForMostRecentDate)
             {
                 DatabaseDateBeforeUpdate = DatabaseDateAfterUpdate = await ReturnLatestDateInTableAsync(filterForIce: false).ConfigureAwait(false);
                 // DatabaseDateBeforeUpdate = DatabaseDateAfterUpdate = await Task.Run(() => ReturnLatestDateInTable(filterForIce: false)).ConfigureAwait(false);                
-                _mostRecentDateRetrieved = true;
+                _databaseQueriedForMostRecentDate = true;
             }
+
             CurrentStatus = ReportStatusCode.CheckingDataAvailability;
 
             if (!DebugActive)
@@ -335,7 +288,8 @@ public partial class Report : IDisposable
                     }
 
                     var failureCodes = new ReportStatusCode[] { ReportStatusCode.NoUpdateAvailable, ReportStatusCode.Failure };
-                    if (failureCodes.Contains(s_retrievalLockingStatusCode) && DatabaseDateBeforeUpdate >= s_retrievalLockingDate)
+
+                    if (failureCodes.Contains(s_retrievalLockingStatusCode) && DatabaseDateBeforeUpdate >= s_legacyCombinedDateBeforeApiQuery)
                     {
                         CurrentStatus = ReportStatusCode.NoUpdateAvailable;
                         return;
@@ -344,7 +298,7 @@ public partial class Report : IDisposable
                 }
                 else
                 {
-                    s_retrievalLockingDate = DatabaseDateBeforeUpdate;
+                    s_legacyCombinedDateBeforeApiQuery = DatabaseDateBeforeUpdate;
                 }
             }
 
@@ -664,10 +618,14 @@ public partial class Report : IDisposable
 
         lock (DatabaseConnection)
         {
+            bool closeConnectionOnFinish = false;
             try
             {
-                if (DatabaseConnection.State == System.Data.ConnectionState.Closed) DatabaseConnection.Open();
-
+                if (DatabaseConnection.State == System.Data.ConnectionState.Closed)
+                {
+                    DatabaseConnection.Open();
+                    closeConnectionOnFinish = true;
+                }
                 using OleDbCommand cmd = DatabaseConnection.CreateCommand();
                 Dictionary<string, char> paramaterizedCharByName = new();
 
@@ -741,7 +699,7 @@ public partial class Report : IDisposable
             }
             finally
             {
-                DatabaseConnection.Close();
+                if (closeConnectionOnFinish) DatabaseConnection.Close();
             }
         }
     }
@@ -1115,7 +1073,7 @@ public partial class Report : IDisposable
                                  where rp.Id.Equals(rowId)
                                  select rp).First();
                 report.DatabaseDateBeforeUpdate = report.DatabaseDateAfterUpdate = reader.GetDateTime(1);
-                report._mostRecentDateRetrieved = true;
+                report._databaseQueriedForMostRecentDate = true;
             }
         }
         finally
@@ -1126,6 +1084,56 @@ public partial class Report : IDisposable
 
     [GeneratedRegex("[,]{1}(?=(?:[^\"]*\"[^\"]*\")*(?![^\"]*\"))")]
     private static partial Regex MyRegex();
+    private readonly struct FieldInfo
+    {
+        /// <summary>
+        /// Column Index of the given field within an array of data.
+        /// </summary>
+        public int ColumnIndex { get; }
+        /// <summary>
+        /// OleDbType assigned to the field based on the fields <see cref="EditedColumnName"/> property. 
+        /// </summary>
+        public OleDbType ColumnType { get; }
+        /// <summary>
+        /// Name of the field within the database.
+        /// </summary>
+        public string ColumnName { get; }
+        /// <summary>
+        /// Edited version of <see cref="ColumnName"/> 
+        /// </summary>
+        public string EditedColumnName { get; }
+
+        /// <summary>
+        /// Adjusts <see cref="ColumnName"/> so that it is database compatible.
+        /// </summary>
+        /// <value>Returns <see cref="ColumnName"/> enclosed in square brackets.</value>
+        public string DatabaseAdjustedName => $"[{ColumnName}]";
+        public FieldInfo(int columnIndex, string columnName, string editedColumnName)
+        {
+            ColumnIndex = columnIndex;
+            ColumnName = columnName;
+            EditedColumnName = editedColumnName;
+            ColumnType = CotFieldType(editedColumnName);
+        }
+
+        /// <summary>
+        /// Returns a <see cref="OleDbType"/> based on text within <paramref name="editedDatabaseHeader"/>.
+        /// </summary>
+        /// <param name="editedDatabaseHeader">String used to determine what value should be returned.</param>
+        /// <returns>An <see cref="OleDbType"/> that corresponds with the given header.</returns>
+        static public OleDbType CotFieldType(string editedDatabaseHeader)
+        {
+            var intDesignator = new string[] { "all", "old", "other", "trader", "yymmdd" };
+            return editedDatabaseHeader switch
+            {
+                string a when a.Contains("yyyy", StringComparison.InvariantCultureIgnoreCase) => OleDbType.Date,
+                string b when b.Contains("pct", StringComparison.InvariantCultureIgnoreCase) || b.Contains("conc", StringComparison.InvariantCultureIgnoreCase) => OleDbType.Decimal,
+                string c when intDesignator.Any(x => c.Contains(x, StringComparison.InvariantCultureIgnoreCase)) => OleDbType.Integer,
+                string d when d.Equals("price", StringComparison.InvariantCultureIgnoreCase) => OleDbType.Currency,
+                _ => OleDbType.VarChar
+            };
+        }
+    }
     /*
 /// <summary>
 /// Queries the CFTC API and filters for the displayed headers.
