@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Diagnostics;
 
 var totalElapsedTimeWatch = Stopwatch.StartNew();
+//bool debugMode = true;
 bool debugMode = false;
 
 if (args.Length == 2 || args.Length == 0)

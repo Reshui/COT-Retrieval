@@ -367,7 +367,7 @@ public partial class Report
 
         string comparisonOperator = DebugActive ? ">=" : ">";
         // Make initial API call to find out how many new records are available. Executed only once.
-        var countRecordsUrl = $"{_cftcApiCode}{WantedDataFormat}?$select=count(id)&$where=report_date_as_yyyy_mm_dd {comparisonOperator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'";
+        var countRecordsUrl = $"{_cftcApiCode}{WantedDataFormat}?$select=count(id)&$where={StandardDateFieldName}{comparisonOperator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'";
 
         string? response = await s_cftcApiClient.GetStringAsync(countRecordsUrl).ConfigureAwait(false);
 
@@ -385,7 +385,7 @@ public partial class Report
         while (remainingRecordsToRetrieve > 0)
         {
             CurrentStatus = ReportStatusCode.AttemptingRetrieval;
-            string apiDetails = $"{_cftcApiCode}{WantedDataFormat}?$where=report_date_as_yyyy_mm_dd{comparisonOperator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'&$order=id&$limit={maxRecordsPerLoop}&$offset={offsetCount++}";
+            string apiDetails = $"{_cftcApiCode}{WantedDataFormat}?$where={StandardDateFieldName}{comparisonOperator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'&$order=id&$limit={maxRecordsPerLoop}&$offset={offsetCount++}";
             response = await s_cftcApiClient.GetStringAsync(apiDetails).ConfigureAwait(false);
 
             // Data from the API tends to have an extra line at the end so trim it.
@@ -519,7 +519,7 @@ public partial class Report
 
                 try
                 {
-                    iceCsvRecord = Regex.Split(await sr.ReadLineAsync().ConfigureAwait(false) ?? throw new NullReferenceException("Empty iceCsvRecord"), "[,]{1}(?=(?:[^\"]*\"[^\"]*\")*(?![^\"]*\"))");
+                    iceCsvRecord = SplitOnCommaNotWithinQuotesRegex().Split(await sr.ReadLineAsync().ConfigureAwait(false) ?? throw new NullReferenceException("Empty iceCsvRecord"));
                 }
                 catch (NullReferenceException)
                 {
@@ -655,8 +655,7 @@ public partial class Report
                 }
                 catch (Exception ex2)
                 {
-                    Console.WriteLine("Rollback Exception Type: {0}", ex2.GetType());
-                    Console.WriteLine("  Message: {0}", ex2.Message);
+                    Console.WriteLine("Rollback Exception Type: {0}\n Message: {1}", ex2.GetType(), ex2.Message);
                 }
                 transaction.Dispose();
             }
