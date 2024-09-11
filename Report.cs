@@ -561,7 +561,7 @@ public partial class Report
 
         foreach (string contractCode in priceDataByDateByContractCode.Keys)
         {
-            cmd.Parameters[$"{ContractCodeColumnName}"].Value = contractCode;
+            cmd.Parameters[$"@{ContractCodeColumnName}"].Value = contractCode;
             foreach (DateTime onDate in priceDataByDateByContractCode[contractCode].Keys)
             {
                 string? fieldValue = priceDataByDateByContractCode[contractCode][onDate];
