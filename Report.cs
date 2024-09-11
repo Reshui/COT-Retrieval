@@ -34,6 +34,7 @@ public partial class Report
     /// Standardized date format used to parse CFTC dates or to convert ICE dates.
     /// </summary>
     private const string StandardDateFormat = "yyyy-MM-ddTHH:mm:ss.fff";
+    private const string DatabaseName = "Commitments_Of_Traders_MoshiM";
 
     /// <summary>
     /// Gets or sets an enum that represnts the current state of the instance.
@@ -56,7 +57,7 @@ public partial class Report
     private ReportStatusCode _currentStatus;
 
     /// <summary>
-    /// The table name to target within the database located at <see cref="_microsoftAccessDatabasePath"/>.
+    /// The table name to target within the database.
     /// </summary>
     private readonly string _tableNameWithinDatabase;
 
@@ -87,7 +88,7 @@ public partial class Report
     private static Dictionary<string, FieldInfo>? s_iceColumnMap = null;
 
     /// <summary>
-    /// Gets a <see cref="OleDbConnection"/> object that correlates to this instance's <see cref="QueriedReport"/>.
+    /// <see cref="SqlConnection"/> used to connect to the server.
     /// </summary>
     private static SqlConnection? s_databaseConnection;
 
@@ -111,7 +112,7 @@ public partial class Report
     /// <summary>
     /// Connection string used to connect to the SQL Server database.
     /// </summary> 
-    private const string DatabaseConnectionString = "Data Source=.\\SQLEXPRESS01;Initial Catalog=Commitments_Of_Traders_MoshiM;Trusted_Connection=True;TrustServerCertificate=True;MultipleActiveResultSets=True;Connection Timeout=5";
+    private const string DatabaseConnectionString = "Data Source=.\\SQLEXPRESS01;Trusted_Connection=True;TrustServerCertificate=True;MultipleActiveResultSets=True;Connection Timeout=5";
 
     /// <summary>
     ///  Gets a boolean value that represents if the current instance is Legacy Combined data.
@@ -212,7 +213,7 @@ public partial class Report
         DebugActive = useDebugMode;
         IsLegacyCombined = queriedReport == ReportType.Legacy && retrieveCombinedData;
 
-        _tableNameWithinDatabase = $"{queriedReport.ToString()[0]}_{(retrieveCombinedData == true ? "Combined" : "Futures_Only")}";
+        _tableNameWithinDatabase = $"{DatabaseName}.{queriedReport.ToString()[0]}_{(retrieveCombinedData == true ? "Combined" : "Futures_Only")}";
         _cftcApiCode = s_apiIdentification[retrieveCombinedData][queriedReport];
 
         s_databaseConnection ??= new SqlConnection(DatabaseConnectionString);
@@ -558,7 +559,7 @@ public partial class Report
     /// <returns>Async Task.</returns>
     static async Task UploadPriceDataAsync(Dictionary<string, Dictionary<DateTime, string?>> priceDataByDateByContractCode)
     {
-        SqlCommand cmd = new SqlCommandBuilder(new SqlDataAdapter("Select * From PriceData", s_databaseConnection!)).GetInsertCommand(true);
+        SqlCommand cmd = new SqlCommandBuilder(new SqlDataAdapter($"Select * From {DatabaseName}.PriceData", s_databaseConnection!)).GetInsertCommand(true);
 
         foreach (string contractCode in priceDataByDateByContractCode.Keys)
         {
