@@ -567,8 +567,8 @@ public partial class Report
                 string? fieldValue = priceDataByDateByContractCode[contractCode][onDate];
                 if (!string.IsNullOrEmpty(fieldValue))
                 {
-                    cmd.Parameters[$"{StandardDateFieldName}"].Value = onDate;
-                    cmd.Parameters[$"Price"].Value = decimal.Parse(fieldValue);
+                    cmd.Parameters[$"@{StandardDateFieldName}"].Value = onDate;
+                    cmd.Parameters["@Price"].Value = decimal.Parse(fieldValue);
                     try
                     {
                         await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
