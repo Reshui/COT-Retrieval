@@ -2,16 +2,11 @@ namespace ReportRetriever;
 
 using System.Net.Http.Headers;
 using System.Collections.Concurrent;
-//using System.Data.OleDb;
-//using System.Runtime.Versioning;
 using System.Text.RegularExpressions;
 using System.Globalization;
 using System.Diagnostics;
-
 using Microsoft.Data.SqlClient;
 using System.Data;
-using System.Linq.Expressions;
-using System.IdentityModel.Tokens.Jwt;
 
 public enum ReportType
 {
@@ -88,7 +83,7 @@ public partial class Report
     /// <summary>
     /// Dictionary used to map ICE column names to their respective indexes within the Disaggregated database.
     /// </summary>
-    private static Dictionary<string, FieldInfo?>? s_iceColumnMap = null;
+    private static Dictionary<string, FieldInfo>? s_iceColumnMap = null;
 
     /// <summary>
     /// Gets a <see cref="OleDbConnection"/> object that correlates to this instance's <see cref="QueriedReport"/>.
@@ -115,7 +110,7 @@ public partial class Report
     /// <summary>
     /// Connection string used to connect to the database located at <see cref="_microsoftAccessDatabasePath"/>.
     /// </summary> 
-    private const string DatabaseConnectionString = "Data Source=Campbell-PC\\SQLEXPRESS01;Initial Catalog=Commitments_Of_Traders_MoshiM;Trusted_Connection=True;TrustServerCertificate=True;";
+    private const string DatabaseConnectionString = "Data Source=Campbell-PC\\SQLEXPRESS01;Initial Catalog=Commitments_Of_Traders_MoshiM;Trusted_Connection=True;TrustServerCertificate=True;MultipleActiveResultSets=True";
 
     /// <summary>
     ///  Gets a boolean value that represents if the current instance is Legacy Combined data.
@@ -132,7 +127,7 @@ public partial class Report
     /// <summary>
     /// Gets or sets a DateTime instance that represents the largest date available before data has been retrieved from the CFTC API.
     /// </summary>
-    /// <value>The largest date found within <see cref="_tableNameWithinDatabase"/> the database located at <see cref="_microsoftAccessDatabasePath"/>.</value>
+    /// <value>The largest date found within <see cref="_tableNameWithinDatabase"/> the table inside the database.</value>
     public DateTime DatabaseDateBeforeUpdate { get; private set; }
 
     /// <summary>
@@ -195,13 +190,14 @@ public partial class Report
     /// </summary>
     public string Id { get => $"{QueriedReport.ToString()[0]}{(RetrieveCombinedData ? 'C' : 'F')}"; }
 
+    private const string IceCodes = "('B','Cocoa','G','RC','Wheat','W')";
+
     /// <summary>
     /// Initializes a new instance of the Report class with the specified properties.
     /// </summary>
     /// <param name="queriedReport">A <see cref="ReportType"/> enum used to specify what sort of data should be retrieved with this instance.</param>
     /// <param name="retrieveCombinedData"><see langword="true"/> if Futures + Options data should be filtered for; otherwise, <see langword="false"/> for Futures Only data.</param>
     /// <param name="microsoftAccessDatabasePath">File path to database that data should be stored in.</param>
-    /// <exception cref="FileNotFoundException">Thrown if <paramref name="microsoftAccessDatabasePath"/> cannot be found.</exception>
     /// <exception cref="ArgumentOutOfRangeException">Thrown if an <paramref name="queriedReport"/> is out of range.</exception>
     public Report(ReportType queriedReport, bool retrieveCombinedData, bool useDebugMode = false)
     {
@@ -226,15 +222,15 @@ public partial class Report
     /// </summary>
     /// <param name="yahooPriceSymbolByContractCode">Dictionary of price symbols keyed to cftc contract codes.</param>
     /// <param name="testUpload">If <see langword="true"/> and <see cref="DebugActive"/> is <see langword="true"/> then data upload will be tested.</param>
-    /// <returns><see langword="true"/> if no errors are generated; otherwise, <see langword="false"/>.</returns>
+    /// <returns>An asyc Task.</returns>
     /// <remarks>Price data will only be retrieved if <see cref="IsLegacyCombined"/> is <see langword="true"/>.</remarks>
     /// <exception cref="HttpRequestException">Thrown if unable to connecto to API service.</exception>
     /// <exception cref="KeyNotFoundException">Thrown if a necessary key for data upload wasn't found.</exception>
     /// <exception cref="NullReferenceException">Thrown if a null value is returned for a field necessary for data upload.</exception>
-    /// <exception cref="OleDbException">Database error.</exception>
+    /// <exception cref="SqlException">Database error.</exception>
     /// <exception cref="IndexOutOfRangeException">Indicates an error in record length returned from source.</exception>
     /// <exception cref="ArgumentException"></exception>
-    public async Task CommitmentsOfTradersRetrievalAndUploadAsync(Dictionary<string, string>? yahooPriceSymbolByContractCode, bool testUpload = false)
+    public async Task CommitmentsOfTradersRetrievalAndUploadAsync(Dictionary<string, string>? yahooPriceSymbolByContractCode, bool testUpload = false, bool userAllowsPriceDownload = false)
     {
         try
         {
@@ -244,7 +240,6 @@ public partial class Report
             if (!_mostRecentDateRetrieved)
             {
                 DatabaseDateBeforeUpdate = DatabaseDateAfterUpdate = await ReturnLatestDateInTableAsync(filterForIce: false).ConfigureAwait(false);
-                // DatabaseDateBeforeUpdate = DatabaseDateAfterUpdate = await Task.Run(() => ReturnLatestDateInTable(filterForIce: false)).ConfigureAwait(false);                
                 _mostRecentDateRetrieved = true;
             }
 
@@ -282,7 +277,7 @@ public partial class Report
             // Dictionary to keep track of wanted date and contract code combinations. 
             Dictionary<string, Dictionary<DateTime, string?>> priceByDateByContractCode = new();
             // (New data from API, Mapped FieldInfo instances for each column or null)
-            (List<string[]> cftcData, Dictionary<string, FieldInfo?>? cftcFieldInfoByEditedName) = await CftcCotRetrievalAsync(queryReturnLimit, priceByDateByContractCode, databaseFieldNames).ConfigureAwait(false);
+            (List<string[]> cftcData, Dictionary<string, FieldInfo>? cftcFieldInfoByEditedName) = await CftcCotRetrievalAsync(queryReturnLimit, priceByDateByContractCode, databaseFieldNames).ConfigureAwait(false);
 
             List<string[]>? iceData = null;
 
@@ -296,7 +291,7 @@ public partial class Report
                 }
 
                 // Only retrieve price data for Legacy Combined instances since it encompases both Disaggregated and Traders in Financial Futures reports.
-                if (IsLegacyCombined && yahooPriceSymbolByContractCode != null)
+                if (IsLegacyCombined && yahooPriceSymbolByContractCode != null && userAllowsPriceDownload)
                 {
                     bool retrievePrices = true;
                     if (DebugActive)
@@ -306,9 +301,8 @@ public partial class Report
                         if (keyResponse.Key != ConsoleKey.Y) retrievePrices = false;
                     }
 
-                    if (retrievePrices && false)
+                    if (retrievePrices)
                     {
-                        // Re-enable when Yahoo Finance works again.
                         tasksToWaitFor.Add(RetrieveYahooPriceDataAsync(yahooPriceSymbolByContractCode, priceByDateByContractCode).ContinueWith(x => UploadPriceDataAsync(priceByDateByContractCode)));
                     }
                 }
@@ -354,7 +348,7 @@ public partial class Report
     /// <exception cref="HttpRequestException">Thrown if an error occurs while attempting to access the CFTC API.</exception>
     /// <exception cref="KeyNotFoundException">Thrown if an unknown key is used to access the fieldInfoByEditedName dictionary.</exception>
     /// <exception cref="NullReferenceException">Thrown if an attempt to use a null value from fieldInfoByEditedName dictionary.</exception>
-    private async Task<(List<string[]>, Dictionary<string, FieldInfo?>?)> CftcCotRetrievalAsync(int maxRecordsPerLoop, Dictionary<string, Dictionary<DateTime, string?>> priceByDateByContractCode, List<string> databaseFieldNames)
+    private async Task<(List<string[]>, Dictionary<string, FieldInfo>?)> CftcCotRetrievalAsync(int maxRecordsPerLoop, Dictionary<string, Dictionary<DateTime, string?>> priceByDateByContractCode, List<string> databaseFieldNames)
     {
         // https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types
         const string WantedDataFormat = ".csv", MimeType = "text/csv";
@@ -369,7 +363,7 @@ public partial class Report
         // List will contain records cleared for database upload.
         List<string[]> newCftcData = new();
         // Dictionary will hold mapped FieldInfo instances for fields within the API and local database.
-        Dictionary<string, FieldInfo?>? fieldInfoByEditedName = null;
+        Dictionary<string, FieldInfo>? fieldInfoByEditedName = null;
 
         string comparisonOperator = DebugActive ? ">=" : ">";
         // Make initial API call to find out how many new records are available. Executed only once.
@@ -402,8 +396,8 @@ public partial class Report
 
             fieldInfoByEditedName ??= MapHeaderFieldsToDatabase(externalHeaders: Regex.Split(responseLines[0], "[,]{1}(?=(?:[^\"]*\"[^\"]*\")*(?![^\"]*\"))"), databaseFields: databaseFieldNames, iceHeaders: false);
 
-            int cftcDateColumn = (int)fieldInfoByEditedName[$"@{StandardDateFieldName}"]?.ColumnIndex!;
-            int cftcCodeColumn = (int)fieldInfoByEditedName[$"@{ContractCodeColumnName}"]?.ColumnIndex!;
+            int cftcDateColumn = fieldInfoByEditedName[$"@{StandardDateFieldName}"].ColumnIndex;
+            int cftcCodeColumn = fieldInfoByEditedName[$"@{ContractCodeColumnName}"].ColumnIndex;
 
             // Start index at 1 rather than 0 to skip over headers.
             for (var i = 1; i < responseLines.Length; ++i)
@@ -478,7 +472,7 @@ public partial class Report
         }
 
         await Task.WhenAll(s_iceCsvRawData.Values!);
-        int futOrCombinedColumn = (int)s_iceColumnMap!["futonly_or_combined"]?.ColumnIndex!;
+        int futOrCombinedColumn = (int)s_iceColumnMap!["futonly_or_combined"].ColumnIndex!;
         // Filter for data relevant to the current instance and is more recent than what is stored in the database.
         var iceQuery = from kvp in s_iceCsvRawData
                        let weeklyTaskLocated = kvp.Key.Equals(WeeklyIceKey)
@@ -536,8 +530,9 @@ public partial class Report
                 {
                     foundHeaders = true;
                     s_iceColumnMap ??= MapHeaderFieldsToDatabase(iceCsvRecord, databaseHeaders, true);
-                    iceDateColumn = (int)s_iceColumnMap[StandardDateFieldName]?.ColumnIndex!;
-                    iceShortDateColumn = (int)s_iceColumnMap.First(x => x.Key.Contains(IceShortDateFormat, StringComparison.InvariantCultureIgnoreCase)).Value?.ColumnIndex!;
+                    iceDateColumn = s_iceColumnMap[$"@{StandardDateFieldName}"].ColumnIndex!;
+
+                    iceShortDateColumn = s_iceColumnMap.First(x => x.Key.Contains(IceShortDateFormat, StringComparison.InvariantCultureIgnoreCase)).Value.ColumnIndex!;
                 }
                 else if (DateTime.TryParseExact(iceCsvRecord[iceShortDateColumn], IceShortDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces, out DateTime parsedDate))
                 {
@@ -555,7 +550,12 @@ public partial class Report
 
         return csvDataByDateTime;
     }
-    async Task UploadPriceDataAsync(Dictionary<string, Dictionary<DateTime, string?>> priceDataByDateByContractCode)
+    /// <summary>
+    /// Uploads price data to the PriceData table.
+    /// </summary>
+    /// <param name="priceDataByDateByContractCode">Dictionary that contains data to upload.</param>
+    /// <returns>Async Task.</returns>
+    static async Task UploadPriceDataAsync(Dictionary<string, Dictionary<DateTime, string?>> priceDataByDateByContractCode)
     {
         SqlCommand cmd = new SqlCommandBuilder(new SqlDataAdapter("Select * From PriceData", s_databaseConnection!)).GetInsertCommand(true);
 
@@ -569,7 +569,15 @@ public partial class Report
                 {
                     cmd.Parameters[$"{StandardDateFieldName}"].Value = onDate;
                     cmd.Parameters[$"Price"].Value = decimal.Parse(fieldValue);
-                    await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+                    try
+                    {
+                        await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+                    }
+                    catch (SqlException e)
+                    {
+                        // Throw if not primary key violation.
+                        if (e.Number != 2627) throw;
+                    }
                 }
             }
         }
@@ -579,15 +587,13 @@ public partial class Report
     /// </summary>
     /// <param name="fieldInfoPerEditedName">Dictionary that maps column names within the database to the equivalent column index within an array in <paramref name="dataToUpload"/>.</param>
     /// <param name="dataToUpload">A list of string arrays that data will be pulled from and uploaded to the database.</param>
-    /// <param name="priceData">Dictionary of price information only supplied when <see cref="IsLegacyCombined"/> equals <see langword="true"/>.</param>
-    /// <param name="uploadingIceData"><see langword="true"/> if uploading ICE data; otherwise, <see langword="false"/> for CFTC data.</param>   
     /// <remarks>Method isn't asynchronous because attempts to use the same <see cref="s_databaseConnection"/> instance from different threads will result in an error.</remarks>
     /// <exception cref="KeyNotFoundException">Thrown if an unknown key is used to access <paramref name="fieldInfoPerEditedName"/>.</exception>
     /// <exception cref="IndexOutOfRangeException">Thrown if a wanted index is out of bounds fora an array in <paramref name="dataToUpload"/>.</exception>
-    /// <exception cref="SqlbException">Error related to database interaction.</exception>
+    /// <exception cref="SqlException">Error related to database interaction.</exception>
     /// <exception cref="ArgumentOutOfRangeException">Thrown if a field type is unaccounted for when assigning a value to a parameter or if <paramref name="fieldInfoPerEditedName"/> contains only null values.</exception>    
     /// <exception cref="InvalidOperationException">Thrown if an error occurs while attempting to comit a database transaction.</exception> 
-    async Task UploadToDatabaseAsync(Dictionary<string, FieldInfo?> fieldInfoPerEditedName, List<string[]> dataToUpload)
+    async Task UploadToDatabaseAsync(Dictionary<string, FieldInfo> fieldInfoPerEditedName, List<string[]> dataToUpload)
     {
         CurrentStatus = ReportStatusCode.AttemptingUpdate;
 
@@ -596,23 +602,25 @@ public partial class Report
         try
         {
             conn.Open();
-
             using SqlCommand cmd = new SqlCommandBuilder(new SqlDataAdapter($"Select * From {_tableNameWithinDatabase}", conn)).GetInsertCommand(true);
-
             transaction = conn.BeginTransaction();
             cmd.Transaction = transaction;
 
             // For each row of data, assign values to wanted parameters.
-            var year3000 = new DateOnly(3000, 1, 1);
+            // var year3000 = new DateOnly(3000, 1, 1);
             foreach (string[] dataRow in dataToUpload)
             {
                 bool permitCommandExecution = false;
                 foreach (SqlParameter param in cmd.Parameters)
                 {
-                    if (fieldInfoPerEditedName.TryGetValue(param.ParameterName, out FieldInfo? knownField))
+                    if (false == fieldInfoPerEditedName.TryGetValue(param.ParameterName, out FieldInfo knownField))
+                    {
+                        param.Value = DBNull.Value;
+                    }
+                    else
                     {
                         permitCommandExecution = true;
-                        string fieldValue = dataRow[(int)knownField?.ColumnIndex!];
+                        string fieldValue = dataRow[knownField.ColumnIndex];
                         if (string.IsNullOrEmpty(fieldValue))
                         {
                             param.Value = DBNull.Value;
@@ -629,23 +637,16 @@ public partial class Report
                             };
                         }
                     }
-                    else
-                    {
-                        param.Value = DBNull.Value;
-                    }
                 }
 
-                if (permitCommandExecution)
+                try
                 {
-                    try
-                    {
-                        await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
-                    }
-                    catch (SqlException e)
-                    {
-                        // If not a duplicate Primary Key error.
-                        if (e.Number != 2627) throw;
-                    }
+                    if (permitCommandExecution) await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+                }
+                catch (SqlException e)
+                {
+                    // If not a duplicate Primary Key error.
+                    if (e.Number != 2627) throw;
                 }
             }
             transaction.Commit();
@@ -733,104 +734,25 @@ public partial class Report
             throw new InvalidOperationException($"{nameof(QueriedReport)} must be {nameof(ReportType.Disaggregated)} while {nameof(filterForIce)} is true.");
         }
 
-        using var con = new SqlConnection(DatabaseConnectionString);
-        using SqlCommand cmd = con.CreateCommand();
+        using SqlCommand cmd = s_databaseConnection!.CreateCommand();
 
-        const string IceCodes = "('B','Cocoa','G','RC','Wheat','W')";
         cmd.CommandText = $"SELECT MAX({StandardDateFieldName}) FROM {_tableNameWithinDatabase} Where {ContractCodeColumnName} {(filterForIce ? string.Empty : "NOT ")}In {IceCodes};";
         DateTime storedDate = s_defaultStartDate;
 
-        try
+        lock (s_databaseConnection)
         {
             if (s_databaseConnection!.State == ConnectionState.Closed)
             {
-                await con.OpenAsync().ConfigureAwait(false);
+                s_databaseConnection.Open();
             }
-            var timer = Stopwatch.StartNew();
-            var cmdResponse = await cmd.ExecuteScalarAsync().ConfigureAwait(false);
-            timer.Stop();
-            storedDate = (DateTime?)cmdResponse ?? s_defaultStartDate;
         }
-        finally
-        {
-            await con.CloseAsync().ConfigureAwait(false);
-        }
-        return storedDate;
-    }
-
-    /// <summary>
-    /// Queries the database for the latest date found within <see cref="_tableNameWithinDatabase"/> .
-    /// </summary>
-    /// <param name="filterForIce"><see langword="true"/> if the latest date for ICE data should be returned; otherwise, <see langword="false"/>.</param>
-    /// <returns>The most recent DateTime found within the database.</returns>
-    DateTime ReturnLatestDateInTable(bool filterForIce)
-    {
-        if (filterForIce && QueriedReport != ReportType.Disaggregated) throw new InvalidOperationException($"{nameof(QueriedReport)} must be {nameof(ReportType.Disaggregated)} while {nameof(filterForIce)} is true.");
-        DateTime storedDate = s_defaultStartDate;
-
-        Console.WriteLine(Id);
         var timer = Stopwatch.StartNew();
-        using var con = new SqlConnection(DatabaseConnectionString);
-        using SqlCommand cmd = con.CreateCommand();
-
-        const string IceCodes = "('B','Cocoa','G','RC','Wheat','W')";
-        cmd.CommandText = $"SELECT  MAX({StandardDateFieldName}) FROM {_tableNameWithinDatabase} Where {ContractCodeColumnName} {(filterForIce ? string.Empty : "NOT ")}In {IceCodes};";
-
-        try
-        {
-            if (con.State == ConnectionState.Closed) con.Open();
-            storedDate = (DateTime?)cmd.ExecuteScalar() ?? s_defaultStartDate;
-        }
-        finally
-        {
-            con.Close();
-        }
+        var cmdResponse = await cmd.ExecuteScalarAsync().ConfigureAwait(false);
         timer.Stop();
-        Console.WriteLine($"{Id} Time to get date, {timer.ElapsedMilliseconds}ms");
+        storedDate = (DateTime?)cmdResponse ?? s_defaultStartDate;
 
         return storedDate;
     }
-
-    /// <summary>
-    /// Asynchronously updates price data with stored data found in the legacy combined database.
-    /// </summary>
-    /// <param name="legacyCombinedInstance"><see cref="Report"/> instance that contains needed information to query prices from.</param>
-    /// <returns>An asynchronous Task</returns>
-    /*public bool UpdatePricesWithLegacyDatabase(Report legacyCombinedInstance)
-    {
-        if (!legacyCombinedInstance.IsLegacyCombined) throw new ArgumentOutOfRangeException(nameof(legacyCombinedInstance), "Must use Legacy Combined instance to update.");
-
-        string sqlCommand = @$"Update {_tableNameWithinDatabase} as T
-                             INNER JOIN [{legacyCombinedInstance._microsoftAccessDatabasePath}].{legacyCombinedInstance._tableNameWithinDatabase} as Source_TBL
-                             ON Source_TBL.report_date_as_yyyy_mm_dd=T.report_date_as_yyyy_mm_dd AND Source_TBL.[CFTC_Contract_Market_Code]=T.[CFTC_Contract_Market_Code]
-                             SET T.[Price] = Source_TBL.[Price] WHERE T.report_date_as_yyyy_mm_dd > ?;";// AND Source_TBL.[Price] IS NOT ?;";
-
-        using var con = new OleDbConnection(DatabaseConnectionString);
-        using OleDbCommand cmd = con.CreateCommand();
-        cmd.CommandText = sqlCommand;
-        cmd.Parameters.AddWithValue("@GreaterThanDate", DatabaseDateBeforeUpdate);
-        // cmd.Parameters.AddWithValue("nullPrice", DBNull.Value);
-
-        //lock (s_databaseConnection)
-        //{
-        try
-        {
-            if (con.State == System.Data.ConnectionState.Closed) con.Open();
-            cmd.ExecuteNonQuery();
-            _waitingForPriceUpdate = false;
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine(e.ToString());
-            return false;
-        }
-        finally
-        {
-            con.Close();
-        }
-        //}
-        return true;
-    }*/
 
     /// <summary>
     /// Queries the database for the field names found within the <see cref="_tableNameWithinDatabase"/> table.
@@ -839,7 +761,7 @@ public partial class Report
     async Task<List<string>> QueryDatabaseFieldNamesAsync()
     {
         List<string> fieldNames = new();
-        //lock (s_databaseConnection)
+
         using var con = new SqlConnection(DatabaseConnectionString);
         try
         {
@@ -868,10 +790,14 @@ public partial class Report
     /// <summary>
     /// Disposes the OleDbConnection associated with this instance.
     /// </summary>
-    public void DisposeConnection()
+    public static void DisposeConnection()
     {
-        if (s_databaseConnection!.State == ConnectionState.Open) s_databaseConnection!.Close();
-        s_databaseConnection!.Dispose();
+        if (s_databaseConnection != null)
+        {
+            if (s_databaseConnection.State == ConnectionState.Open) s_databaseConnection.Close();
+            s_databaseConnection.Dispose();
+            s_databaseConnection = null;
+        }
     }
 
     /// <summary>
@@ -881,10 +807,10 @@ public partial class Report
     /// <param name="databaseFields">List of field names found within the database.</param>
     /// <param name="iceHeaders"><see langword="true"/> if <paramref name="externalHeaders"/> are from an ICE Commitments of Traders report; otherwise, <see langword="false"/> for CFTC reports.</param>
     /// <returns>Returns a dictionary of <see cref="FieldInfo"/> instances keyed to their edited names if the field exists in both <paramref name="externalHeaders"/> and <paramref name="databaseFields"/>; otherwise, a value of null.</returns> 
-    static Dictionary<string, FieldInfo?> MapHeaderFieldsToDatabase(string[] externalHeaders, List<string> databaseFields, bool iceHeaders)
+    static Dictionary<string, FieldInfo> MapHeaderFieldsToDatabase(string[] externalHeaders, List<string> databaseFields, bool iceHeaders)
     {
         // return dictionary keyed to fields within databaseFields with wanted FieldInfo structs as a value 
-        Dictionary<string, FieldInfo?> fieldInfoByEditedName = new();
+        Dictionary<string, FieldInfo> fieldInfoByEditedName = new();
         // Dictionary keyed to api header names with their 0 based column number.
         Dictionary<string, int> headerIndexesByEditedName = new();
 
@@ -1069,10 +995,7 @@ public partial class Report
         /// Column Index of the given field within an array of data.
         /// </summary>
         public int ColumnIndex { get; }
-        /// <summary>
-        /// SqlDbType assigned to the field based on the fields <see cref="EditedColumnName"/> property. 
-        /// </summary>
-        public SqlDbType ColumnType { get; }
+
         /// <summary>
         /// Name of the field within the database.
         /// </summary>
@@ -1096,26 +1019,7 @@ public partial class Report
             ColumnIndex = columnIndex;
             ColumnName = columnName;
             EditedColumnName = editedColumnName;
-            ColumnType = CotFieldType(editedColumnName);
             ParamName = $"@{ColumnName}";
-        }
-
-        /// <summary>
-        /// Returns a <see cref="SqlDbType"/> based on text within <paramref name="editedDatabaseHeader"/>.
-        /// </summary>
-        /// <param name="editedDatabaseHeader">String used to determine what value should be returned.</param>
-        /// <returns>An <see cref="SqlDbType"/> that corresponds with the given header.</returns>
-        static public SqlDbType CotFieldType(string editedDatabaseHeader)
-        {
-            var intDesignator = new string[] { "all", "old", "other", "trader", "yymmdd" };
-            return editedDatabaseHeader switch
-            {
-                string a when a.Contains("yyyy", StringComparison.InvariantCultureIgnoreCase) => SqlDbType.Date,
-                string b when b.Contains("pct", StringComparison.InvariantCultureIgnoreCase) || b.Contains("conc", StringComparison.InvariantCultureIgnoreCase) => SqlDbType.Decimal,
-                string c when intDesignator.Any(x => c.Contains(x, StringComparison.InvariantCultureIgnoreCase)) => SqlDbType.Int,
-                string d when d.Equals("price", StringComparison.InvariantCultureIgnoreCase) => SqlDbType.SmallMoney,
-                _ => SqlDbType.VarChar
-            };
         }
     }
     /*
