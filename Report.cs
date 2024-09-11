@@ -394,7 +394,7 @@ public partial class Report
             // Subtract 1 to account for headers.
             remainingRecordsToRetrieve -= responseLines.Length - 1;
 
-            fieldInfoByEditedName ??= MapHeaderFieldsToDatabase(externalHeaders: Regex.Split(responseLines[0], "[,]{1}(?=(?:[^\"]*\"[^\"]*\")*(?![^\"]*\"))"), databaseFields: databaseFieldNames, iceHeaders: false);
+            fieldInfoByEditedName ??= MapHeaderFieldsToDatabase(externalHeaders: SplitOnCommaNotWithinQuotesRegex().Split(responseLines[0]), databaseFields: databaseFieldNames, iceHeaders: false);
 
             int cftcDateColumn = fieldInfoByEditedName[$"@{StandardDateFieldName}"].ColumnIndex;
             int cftcCodeColumn = fieldInfoByEditedName[$"@{ContractCodeColumnName}"].ColumnIndex;
@@ -404,7 +404,7 @@ public partial class Report
             {
                 if (!string.IsNullOrEmpty(responseLines[i]))
                 {
-                    string[] apiRecord = Regex.Split(responseLines[i], "[,]{1}(?=(?:[^\"]*\"[^\"]*\")*(?![^\"]*\"))").Select(x => x.Trim(s_charactersToTrim)).ToArray();
+                    string[] apiRecord = SplitOnCommaNotWithinQuotesRegex().Split(responseLines[i]).Select(x => x.Trim(s_charactersToTrim)).ToArray();
 
                     if (DateTime.TryParseExact(apiRecord[cftcDateColumn], StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime parsedDate)
                     && ((parsedDate > DatabaseDateBeforeUpdate && !DebugActive) || (parsedDate >= DatabaseDateBeforeUpdate && DebugActive)))
@@ -1049,8 +1049,9 @@ public partial class Report
             cat.Create(DatabaseConnectionString);
         }
     */
-    /*
+
     [GeneratedRegex("[,]{1}(?=(?:[^\"]*\"[^\"]*\")*(?![^\"]*\"))")]
     private static partial Regex SplitOnCommaNotWithinQuotesRegex();
-    */
+    [GeneratedRegex("[,]{1}(?=(?:[^\"]*\"[^\"]*\")*(?![^\"]*\"))")]
+    private static partial Regex MyRegex();
 }
