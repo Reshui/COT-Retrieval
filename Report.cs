@@ -1052,6 +1052,4 @@ public partial class Report
 
     [GeneratedRegex("[,]{1}(?=(?:[^\"]*\"[^\"]*\")*(?![^\"]*\"))")]
     private static partial Regex SplitOnCommaNotWithinQuotesRegex();
-    [GeneratedRegex("[,]{1}(?=(?:[^\"]*\"[^\"]*\")*(?![^\"]*\"))")]
-    private static partial Regex MyRegex();
 }
