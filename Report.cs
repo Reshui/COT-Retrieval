@@ -7,6 +7,7 @@ using System.Globalization;
 using System.Diagnostics;
 using Microsoft.Data.SqlClient;
 using System.Data;
+//using System.Configuration;
 
 public enum ReportType
 {
@@ -108,9 +109,9 @@ public partial class Report
     private static readonly HttpClient s_cftcApiClient = new() { BaseAddress = new Uri("https://publicreporting.cftc.gov/resource/") };
 
     /// <summary>
-    /// Connection string used to connect to the database located at <see cref="_microsoftAccessDatabasePath"/>.
+    /// Connection string used to connect to the SQL Server database.
     /// </summary> 
-    private const string DatabaseConnectionString = "Data Source=Campbell-PC\\SQLEXPRESS01;Initial Catalog=Commitments_Of_Traders_MoshiM;Trusted_Connection=True;TrustServerCertificate=True;MultipleActiveResultSets=True";
+    private const string DatabaseConnectionString = "Data Source=.\\SQLEXPRESS01;Initial Catalog=Commitments_Of_Traders_MoshiM;Trusted_Connection=True;TrustServerCertificate=True;MultipleActiveResultSets=True;Connection Timeout=5";
 
     /// <summary>
     ///  Gets a boolean value that represents if the current instance is Legacy Combined data.
@@ -239,7 +240,7 @@ public partial class Report
 
             if (!_mostRecentDateRetrieved)
             {
-                DatabaseDateBeforeUpdate = DatabaseDateAfterUpdate = await ReturnLatestDateInTableAsync(filterForIce: false).ConfigureAwait(false);
+                DatabaseDateBeforeUpdate = DatabaseDateAfterUpdate = await GetLatestTableDateAsync(filterForIce: false).ConfigureAwait(false);
                 _mostRecentDateRetrieved = true;
             }
 
@@ -437,7 +438,7 @@ public partial class Report
     /// <returns>An asynchronous task.</returns>
     private async Task<List<string[]>?> IceCotRetrievalAsync(DateTime mostRecentCftcDate, List<string> databaseFieldNames, int debugReturnLimit = 1)
     {
-        DateTime maxIceDateInDatabase = await ReturnLatestDateInTableAsync(filterForIce: true).ConfigureAwait(false);
+        DateTime maxIceDateInDatabase = await GetLatestTableDateAsync(filterForIce: true).ConfigureAwait(false);
 
         if (QueriedReport != ReportType.Disaggregated || (maxIceDateInDatabase >= mostRecentCftcDate && !DebugActive)) return null;
 
@@ -472,7 +473,7 @@ public partial class Report
         }
 
         await Task.WhenAll(s_iceCsvRawData.Values!);
-        int futOrCombinedColumn = (int)s_iceColumnMap!["futonly_or_combined"].ColumnIndex!;
+        int futOrCombinedColumn = s_iceColumnMap!["futonly_or_combined"].ColumnIndex;
         // Filter for data relevant to the current instance and is more recent than what is stored in the database.
         var iceQuery = from kvp in s_iceCsvRawData
                        let weeklyTaskLocated = kvp.Key.Equals(WeeklyIceKey)
@@ -490,7 +491,7 @@ public partial class Report
     /// Queries the International Continental Exchange website for Commitments of Traders data.
     /// </summary>
     /// <param name="iceCsvUrl">URL for the csv file to download.</param>
-    /// <param name="databaseHeaders">Headers from the Disaggregated report found within the database located at <see cref="_microsoftAccessDatabasePath"/>.</param>
+    /// <param name="databaseHeaders">Headers from the Disaggregated report found within the database.</param>
     /// <returns>A Date keyed dictionary containg a list of relevant rows.</returns>
     private static async Task<Dictionary<DateTime, List<string[]>>> QueryIceDataAsync(string iceCsvUrl, List<string> databaseHeaders, bool DebugActive)
     {
@@ -718,8 +719,8 @@ public partial class Report
     /// Queries the database for the latest date found within <see cref="_tableNameWithinDatabase"/> .
     /// </summary>
     /// <param name="filterForIce"><see langword="true"/> if the latest date for ICE data should be returned; otherwise, <see langword="false"/>.</param>
-    /// <returns>The most recent DateTime found within the database.</returns>
-    async Task<DateTime> ReturnLatestDateInTableAsync(bool filterForIce)
+    /// <returns>The most recent DateTime found in the <see cref="StandardDateFieldName"/> column within the database.</returns>
+    async Task<DateTime> GetLatestTableDateAsync(bool filterForIce)
     {
         if (filterForIce && QueriedReport != ReportType.Disaggregated)
         {
