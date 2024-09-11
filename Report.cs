@@ -313,7 +313,7 @@ public partial class Report
                     {
                         try
                         {   // Make an attempt to upload ICE data.
-                            tasksToWaitFor.Add(UploadToDatabaseAsync(fieldInfoPerEditedName: s_iceColumnMap, dataToUpload: iceData));
+                            tasksToWaitFor.Add(UploadToDatabaseAsync(fieldInfoPerEditedName: s_iceColumnMap, dataToUpload: iceData, true));
                         }
                         catch (Exception e)
                         {   // ICE is low priority so just print the error.
@@ -321,7 +321,7 @@ public partial class Report
                         }
                     }
                     // Make an attempt to upload CFTC data.
-                    tasksToWaitFor.Add(UploadToDatabaseAsync(fieldInfoPerEditedName: cftcFieldInfoByEditedName, dataToUpload: cftcData));
+                    tasksToWaitFor.Add(UploadToDatabaseAsync(fieldInfoPerEditedName: cftcFieldInfoByEditedName, dataToUpload: cftcData, false));
                 }
                 if (tasksToWaitFor.Any()) await Task.WhenAll(tasksToWaitFor).ConfigureAwait(false);
             }
@@ -593,7 +593,7 @@ public partial class Report
     /// <exception cref="SqlException">Error related to database interaction.</exception>
     /// <exception cref="ArgumentOutOfRangeException">Thrown if a field type is unaccounted for when assigning a value to a parameter or if <paramref name="fieldInfoPerEditedName"/> contains only null values.</exception>    
     /// <exception cref="InvalidOperationException">Thrown if an error occurs while attempting to comit a database transaction.</exception> 
-    async Task UploadToDatabaseAsync(Dictionary<string, FieldInfo> fieldInfoPerEditedName, List<string[]> dataToUpload)
+    async Task UploadToDatabaseAsync(Dictionary<string, FieldInfo> fieldInfoPerEditedName, List<string[]> dataToUpload, bool uploadingIceData)
     {
         CurrentStatus = ReportStatusCode.AttemptingUpdate;
 
@@ -605,43 +605,36 @@ public partial class Report
             using SqlCommand cmd = new SqlCommandBuilder(new SqlDataAdapter($"Select * From {_tableNameWithinDatabase}", conn)).GetInsertCommand(true);
             transaction = conn.BeginTransaction();
             cmd.Transaction = transaction;
-
+            bool successfullyInsertedRecords = false;
             // For each row of data, assign values to wanted parameters.
             // var year3000 = new DateOnly(3000, 1, 1);
             foreach (string[] dataRow in dataToUpload)
             {
-                bool permitCommandExecution = false;
                 foreach (SqlParameter param in cmd.Parameters)
                 {
-                    if (false == fieldInfoPerEditedName.TryGetValue(param.ParameterName, out FieldInfo knownField))
+                    string? fieldValue = fieldInfoPerEditedName.TryGetValue(param.ParameterName, out FieldInfo knownField) ? dataRow[knownField.ColumnIndex] : null;
+
+                    if (string.IsNullOrEmpty(fieldValue))
                     {
                         param.Value = DBNull.Value;
                     }
                     else
                     {
-                        permitCommandExecution = true;
-                        string fieldValue = dataRow[knownField.ColumnIndex];
-                        if (string.IsNullOrEmpty(fieldValue))
+                        param.Value = param.SqlDbType switch
                         {
-                            param.Value = DBNull.Value;
-                        }
-                        else
-                        {
-                            param.Value = param.SqlDbType switch
-                            {
-                                SqlDbType.Int or SqlDbType.SmallInt or SqlDbType.TinyInt => int.Parse(fieldValue, NumberStyles.AllowDecimalPoint | NumberStyles.AllowThousands | NumberStyles.AllowLeadingSign),
-                                SqlDbType.SmallMoney or SqlDbType.Decimal => decimal.Parse(fieldValue),
-                                SqlDbType.VarChar => fieldValue,
-                                SqlDbType.Date => DateTime.ParseExact(fieldValue, StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None),
-                                _ => throw new ArgumentOutOfRangeException(nameof(fieldInfoPerEditedName), param.SqlDbType, $"An unaccounted for SqlDbType was encountered when accessing {param.ParameterName}.")
-                            };
-                        }
+                            SqlDbType.Int or SqlDbType.SmallInt or SqlDbType.TinyInt => int.Parse(fieldValue, NumberStyles.AllowDecimalPoint | NumberStyles.AllowThousands | NumberStyles.AllowLeadingSign),
+                            SqlDbType.SmallMoney or SqlDbType.Decimal => decimal.Parse(fieldValue),
+                            SqlDbType.VarChar => fieldValue,
+                            SqlDbType.Date => DateTime.ParseExact(fieldValue, StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None),
+                            _ => throw new ArgumentOutOfRangeException(nameof(fieldInfoPerEditedName), param.SqlDbType, $"An unaccounted for SqlDbType was encountered when accessing {param.ParameterName}.")
+                        };
                     }
                 }
 
                 try
                 {
-                    if (permitCommandExecution) await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+                    await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+                    successfullyInsertedRecords = true;
                 }
                 catch (SqlException e)
                 {
@@ -650,7 +643,7 @@ public partial class Report
                 }
             }
             transaction.Commit();
-            CurrentStatus = ReportStatusCode.Updated;
+            if (!uploadingIceData) CurrentStatus = successfullyInsertedRecords ? ReportStatusCode.Updated : ReportStatusCode.Failure;
         }
         catch (Exception)
         {
