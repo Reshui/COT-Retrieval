@@ -228,13 +228,16 @@ public partial class Report
         {
             s_databaseConnection = new SqlConnection(DatabaseConnectionString);
             using var cmd = s_databaseConnection.CreateCommand();
-            cmd.CommandText = $"IF NOT Exists(Select name from sys.databases where name=@database) BEGIN CREATE DATABASE {DatabaseName} END;";
+
+            cmd.CommandText = $"IF NOT Exists(Select name from sys.databases where name=@database) BEGIN CREATE DATABASE {DatabaseName}; END;";
             cmd.Parameters.AddWithValue("@database", DatabaseName);
 
             s_databaseConnection.Open();
             cmd.ExecuteNonQuery();
-            // To Do: Check for database existance and create tables if needed.
             s_databaseConnection.ChangeDatabase(DatabaseName);
+            cmd.CommandText = $"IF NOT EXISTS (Select name FROM sys.Tables WHERE name='PriceData') BEGIN CREATE TABLE PriceData (report_date_as_yyyy_mm_dd Date NOT NULL, cftc_contract_market_code VARCHAR(10) NOT NULL, price smallmoney NOT NULL, Primary Key (report_date_as_yyyy_mm_dd, cftc_contract_market_code)); END;";
+            cmd.Parameters.Clear();
+            cmd.ExecuteNonQuery();
         }
     }
 
@@ -503,7 +506,7 @@ public partial class Report
         // Given this methods async properties, 2 instances may be attempting to download ICE data at the same time.
         while (s_activeIceRetrievalCount > 0)
         {
-            await Task.Delay(300);
+            await Task.Delay(300).ConfigureAwait(false);
         }
 
         await Task.WhenAll(s_iceCsvRawData.Values!);
@@ -594,16 +597,20 @@ public partial class Report
     {
         SqlCommand cmd = new SqlCommandBuilder(new SqlDataAdapter($"Select * From PriceData", s_databaseConnection!)).GetInsertCommand(true);
 
+        SqlParameter ccParameter = cmd.Parameters[$"@{ContractCodeColumnName}"];
+        SqlParameter dateParameter = cmd.Parameters[$"@{StandardDateFieldName}"];
+        SqlParameter priceParameter = cmd.Parameters["@Price"];
+
         foreach (string contractCode in priceDataByDateByContractCode.Keys)
         {
-            cmd.Parameters[$"@{ContractCodeColumnName}"].Value = contractCode;
+            ccParameter.Value = contractCode;
             foreach (DateTime onDate in priceDataByDateByContractCode[contractCode].Keys)
             {
                 string? fieldValue = priceDataByDateByContractCode[contractCode][onDate];
                 if (!string.IsNullOrEmpty(fieldValue))
                 {
-                    cmd.Parameters[$"@{StandardDateFieldName}"].Value = onDate;
-                    cmd.Parameters["@Price"].Value = decimal.Parse(fieldValue);
+                    dateParameter.Value = onDate;
+                    priceParameter.Value = decimal.Parse(fieldValue);
                     try
                     {
                         await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
@@ -643,7 +650,6 @@ public partial class Report
             cmd.Transaction = transaction;
             bool successfullyInsertedRecords = false;
             // For each row of data, assign values to wanted parameters.
-            // var year3000 = new DateOnly(3000, 1, 1);
             foreach (string[] dataRow in dataToUpload)
             {
                 foreach (SqlParameter param in cmd.Parameters)
@@ -1001,15 +1007,19 @@ public partial class Report
         var document = JsonNode.Parse(jsonResponse)!;
         JsonNode root = document.Root;
         JsonArray columnInfo = root["columns"]!.AsArray();
-        var columnsToDrop = "id,futonly_or_combined".Split(',');
+        var columnsToDrop = "id,futonly_or_combined,commodity_name".Split(',');
         // The name field is selected for because it hasn't been renamed improperly.
         var fieldNames = (from column in columnInfo
                           let columnName = column["fieldName"]!.GetValue<string>()
-                          where !(columnsToDrop.Any(columnName.Equals) || columnName.Equals("commodity_name"))
+                          where !columnsToDrop.Any(columnName.Equals)
                           select column["name"]!.GetValue<string>().ToLower().Replace(' ', '_'))!.ToArray();
 
         return fieldNames;
     }
+    /// <summary>
+    /// Builds an SQL command for the creation of a SQL Table for current instance.
+    /// </summary>
+    /// <returns>An asynchronous Task.</returns>
     private async Task<string> CreateReportTableSQLAsync()
     {
         var builder = new StringBuilder();
@@ -1032,7 +1042,8 @@ public partial class Report
                 if (name.StartsWith("pct_of_open_interest"))
                 {
                     // It is one of oi_all/old/other
-                    builder.Append($"{name} TINYINT");
+                    string[] splitName = name.Split('_');
+                    builder.Append($"pct_of_oi_{splitName[^1]} TINYINT");
                 }
                 else
                 {
@@ -1099,6 +1110,9 @@ public partial class Report
         /// <value>Returns <see cref="ColumnName"/> enclosed in square brackets.</value>
         public string DatabaseAdjustedName => $"[{ColumnName}]";
 
+        /// <summary>
+        /// String used to target an auto generated parameter when uploading to the database.
+        /// </summary>
         public string ParamName { get; }
 
         public FieldInfo(int columnIndex, string columnName, string editedColumnName)
