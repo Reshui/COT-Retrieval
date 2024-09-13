@@ -18,7 +18,7 @@ public enum ReportType
 }
 public enum ReportStatusCode
 {
-    NoUpdateAvailable, Updated, Failure, AttemptingRetrieval, AttemptingUpdate, NotInitialized, CheckingDataAvailability, OnlyDuplicateRecordsInUpdate
+    NoUpdateAvailable, Updated, Failure, AttemptingRetrieval, AttemptingUpdate, NotInitialized, CheckingDataAvailability, OnlyDuplicateRecordsInUpdate, LockingInstanceFailure
 }
 
 public partial class Report
@@ -165,10 +165,6 @@ public partial class Report
     /// Timer used to time how long it takes to retrieve and upload data.
     /// </summary>
     public readonly Stopwatch ActionTimer = new();
-    /// <summary>
-    /// Boolean that describes if lates date data has been queried from the database.
-    /// </summary>
-    private bool _mostRecentDateRetrieved = false;
 
     /// <summary>
     /// Dictionary used to access specific APIs related to COT data and keyed to whether or not Futures + Options data is wanted.
@@ -265,11 +261,7 @@ public partial class Report
 
             await CreateReportTableIfMissingAsync().ConfigureAwait(false);
 
-            if (!_mostRecentDateRetrieved)
-            {
-                DatabaseDateBeforeUpdate = DatabaseDateAfterUpdate = await GetLatestTableDateAsync(filterForIce: false).ConfigureAwait(false);
-                _mostRecentDateRetrieved = true;
-            }
+            DatabaseDateBeforeUpdate = DatabaseDateAfterUpdate = await GetLatestTableDateAsync(filterForIce: false).ConfigureAwait(false);
 
             CurrentStatus = ReportStatusCode.CheckingDataAvailability;
 
@@ -286,9 +278,11 @@ public partial class Report
                     }
 
                     var failureCodes = new ReportStatusCode[] { ReportStatusCode.NoUpdateAvailable, ReportStatusCode.Failure };
+
                     if (failureCodes.Contains(s_retrievalLockingStatusCode) && DatabaseDateBeforeUpdate >= s_retrievalLockingDate)
                     {
-                        CurrentStatus = ReportStatusCode.NoUpdateAvailable;
+                        // If lockin instance failed then use the appropriate enum else assign no update available.
+                        CurrentStatus = s_retrievalLockingStatusCode == ReportStatusCode.Failure ? ReportStatusCode.LockingInstanceFailure : ReportStatusCode.NoUpdateAvailable;
                         return;
                     }
                     ActionTimer.Start();
@@ -314,7 +308,7 @@ public partial class Report
             if (cftcData.Any() && cftcFieldInfoByEditedName is not null)
             {
                 // Only retrieve price data for Legacy Combined instances since it encompases both Disaggregated and Traders in Financial Futures reports.
-                if (IsLegacyCombined && yahooPriceSymbolByContractCode != null && userAllowsPriceDownload)
+                if (IsLegacyCombined && userAllowsPriceDownload && (priceByDateByContractCode?.Any() ?? false))
                 {
                     bool retrievePrices = true;
                     if (DebugActive)
@@ -326,7 +320,7 @@ public partial class Report
 
                     if (retrievePrices)
                     {
-                        tasksToWaitFor.Add(RetrieveYahooPriceDataAsync(yahooPriceSymbolByContractCode, priceByDateByContractCode).ContinueWith(x => UploadPriceDataAsync(priceByDateByContractCode)));
+                        tasksToWaitFor.Add(RetrieveYahooPriceDataAsync(yahooPriceSymbolByContractCode!, priceByDateByContractCode).ContinueWith(x => UploadPriceDataAsync(priceByDateByContractCode)));
                     }
                 }
 
@@ -338,13 +332,10 @@ public partial class Report
                     tasksToWaitFor.Add(UploadToDatabaseAsync(fieldInfoPerEditedName: cftcFieldInfoByEditedName, dataToUpload: cftcData, false));
                 }
 
-                DateTime maxCFTCDate = (from datePricePair in priceByDateByContractCode.Values
-                                        from d in datePricePair.Keys
-                                        select d).Max();
-
                 if (QueriedReport == ReportType.Disaggregated)
                 {
-                    iceData = await IceCotRetrievalAsync(maxCFTCDate, databaseFieldNames, queryReturnLimit).ConfigureAwait(false);
+                    // DatabaseDateBeforeUpdate is assigned a value in CftcCotRetrievalAsync().
+                    iceData = await IceCotRetrievalAsync(DatabaseDateBeforeUpdate, databaseFieldNames, queryReturnLimit).ConfigureAwait(false);
 
                     if (permitUpload && s_iceColumnMap != null && (iceData?.Any() ?? false))
                     {
@@ -362,7 +353,6 @@ public partial class Report
                 if (tasksToWaitFor.Any())
                 {
                     await Task.WhenAll(tasksToWaitFor).ConfigureAwait(false);
-                    if (CurrentStatus == ReportStatusCode.Updated) DatabaseDateAfterUpdate = maxCFTCDate;
                 }
             }
             else
@@ -373,6 +363,7 @@ public partial class Report
         catch (Exception)
         {
             CurrentStatus = ReportStatusCode.Failure;
+            DatabaseDateAfterUpdate = DatabaseDateBeforeUpdate;
             throw;
         }
         finally
@@ -425,7 +416,7 @@ public partial class Report
         while (remainingRecordsToRetrieve > 0)
         {
             CurrentStatus = ReportStatusCode.AttemptingRetrieval;
-            string apiDetails = $"{_cftcApiCode}{WantedDataFormat}?$where={StandardDateFieldName}{comparisonOperator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'&$order=id&$limit={maxRecordsPerLoop}&$offset={offsetCount++}";
+            string apiDetails = $"{_cftcApiCode}{WantedDataFormat}?$where={StandardDateFieldName}{comparisonOperator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'&$order=report_date_as_yyyy_mm_dd,id&$limit={maxRecordsPerLoop}&$offset={offsetCount++}";
             response = await s_cftcApiClient.GetStringAsync(apiDetails).ConfigureAwait(false);
 
             // Data from the API tends to have an extra line at the end so trim it.
@@ -495,7 +486,7 @@ public partial class Report
         else if (!singleWeekRetrieval)
         {
             const int IceStartYear = 2011;
-            for (var csvYear = Math.Max(maxIceDateInDatabase.Year, IceStartYear); csvYear <= DatabaseDateAfterUpdate.Year; ++csvYear)
+            for (var csvYear = Math.Max(maxIceDateInDatabase.Year, IceStartYear); csvYear <= mostRecentCftcDate.Year; ++csvYear)
             {
                 string iceCsvUrl = $"https://www.ice.com/publicdocs/futures/COTHist{csvYear}.csv";
                 if (s_iceCsvRawData.TryAdd(iceCsvUrl, null))
@@ -689,7 +680,10 @@ public partial class Report
                 }
             }
             transaction.Commit();
-            if (!uploadingIceData) CurrentStatus = successfullyInsertedRecords ? ReportStatusCode.Updated : (duplicateInsertionCount == dataToUpload.Count) ? ReportStatusCode.OnlyDuplicateRecordsInUpdate : ReportStatusCode.Failure;
+            if (!uploadingIceData)
+            {
+                CurrentStatus = successfullyInsertedRecords ? ReportStatusCode.Updated : (duplicateInsertionCount == dataToUpload.Count) ? ReportStatusCode.OnlyDuplicateRecordsInUpdate : ReportStatusCode.Failure;
+            }
         }
         catch (Exception)
         {
