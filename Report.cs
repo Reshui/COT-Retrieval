@@ -18,7 +18,7 @@ public enum ReportType
 }
 public enum ReportStatusCode
 {
-    NoUpdateAvailable, Updated, Failure, AttemptingRetrieval, AttemptingUpdate, NotInitialized, CheckingDataAvailability
+    NoUpdateAvailable, Updated, Failure, AttemptingRetrieval, AttemptingUpdate, NotInitialized, CheckingDataAvailability, OnlyDuplicateRecordsInUpdate
 }
 
 public partial class Report
@@ -241,6 +241,8 @@ public partial class Report
         }
     }
 
+
+
     /// <summary>
     /// Retrieves related data from api and uploads to a local database if new data is retrieved.
     /// </summary>
@@ -261,19 +263,7 @@ public partial class Report
             if (!DebugActive && testUpload) throw new ArgumentException($"Cannot test upload if {nameof(DebugActive)} is false.");
             ActionTimer.Start();
 
-            {
-                using var tableCMD = s_databaseConnection!.CreateCommand();
-                tableCMD.CommandText = $"SELECT COUNT(name) FROM sys.Tables WHERE name =@name";
-                tableCMD.Parameters.AddWithValue("@name", _tableNameWithinDatabase);
-
-                bool? reportTableExists = (await tableCMD.ExecuteScalarAsync().ConfigureAwait(false))?.Equals(1);
-
-                if (!(reportTableExists ??= false))
-                {
-                    string sql = await CreateReportTableSQLAsync().ConfigureAwait(false);
-                    await ExecuteNonQuery(sql).ConfigureAwait(false);
-                }
-            }
+            await CreateReportTableIfMissingAsync().ConfigureAwait(false);
 
             if (!_mostRecentDateRetrieved)
             {
@@ -323,11 +313,6 @@ public partial class Report
 
             if (cftcData.Any() && cftcFieldInfoByEditedName is not null)
             {
-                if (QueriedReport == ReportType.Disaggregated)
-                {
-                    iceData = await IceCotRetrievalAsync(DatabaseDateAfterUpdate, databaseFieldNames, queryReturnLimit).ConfigureAwait(false);
-                }
-
                 // Only retrieve price data for Legacy Combined instances since it encompases both Disaggregated and Traders in Financial Futures reports.
                 if (IsLegacyCombined && yahooPriceSymbolByContractCode != null && userAllowsPriceDownload)
                 {
@@ -345,9 +330,23 @@ public partial class Report
                     }
                 }
 
-                if (!DebugActive || testUpload)
+                bool permitUpload = !DebugActive || testUpload;
+
+                if (permitUpload)
                 {
-                    if (QueriedReport == ReportType.Disaggregated && iceData != null && s_iceColumnMap != null && iceData.Any())
+                    // Make an attempt to upload CFTC data.
+                    tasksToWaitFor.Add(UploadToDatabaseAsync(fieldInfoPerEditedName: cftcFieldInfoByEditedName, dataToUpload: cftcData, false));
+                }
+
+                DateTime maxCFTCDate = (from datePricePair in priceByDateByContractCode.Values
+                                        from d in datePricePair.Keys
+                                        select d).Max();
+
+                if (QueriedReport == ReportType.Disaggregated)
+                {
+                    iceData = await IceCotRetrievalAsync(maxCFTCDate, databaseFieldNames, queryReturnLimit).ConfigureAwait(false);
+
+                    if (permitUpload && s_iceColumnMap != null && (iceData?.Any() ?? false))
                     {
                         try
                         {   // Make an attempt to upload ICE data.
@@ -358,10 +357,17 @@ public partial class Report
                             Console.WriteLine(e);
                         }
                     }
-                    // Make an attempt to upload CFTC data.
-                    tasksToWaitFor.Add(UploadToDatabaseAsync(fieldInfoPerEditedName: cftcFieldInfoByEditedName, dataToUpload: cftcData, false));
                 }
-                if (tasksToWaitFor.Any()) await Task.WhenAll(tasksToWaitFor).ConfigureAwait(false);
+
+                if (tasksToWaitFor.Any())
+                {
+                    await Task.WhenAll(tasksToWaitFor).ConfigureAwait(false);
+                    if (CurrentStatus == ReportStatusCode.Updated) DatabaseDateAfterUpdate = maxCFTCDate;
+                }
+            }
+            else
+            {
+                CurrentStatus = ReportStatusCode.NoUpdateAvailable;
             }
         }
         catch (Exception)
@@ -411,11 +417,7 @@ public partial class Report
 
         remainingRecordsToRetrieve = int.Parse(response.Split('\n')[1].Trim(s_charactersToTrim), NumberStyles.Number, null);
 
-        if (remainingRecordsToRetrieve == 0)
-        {
-            CurrentStatus = ReportStatusCode.NoUpdateAvailable;
-        }
-        else if (DebugActive)
+        if (remainingRecordsToRetrieve > 0 && DebugActive)
         {
             remainingRecordsToRetrieve = Math.Min(maxRecordsPerLoop, remainingRecordsToRetrieve);
         }
@@ -649,6 +651,7 @@ public partial class Report
             transaction = conn.BeginTransaction();
             cmd.Transaction = transaction;
             bool successfullyInsertedRecords = false;
+            int duplicateInsertionCount = 0;
             // For each row of data, assign values to wanted parameters.
             foreach (string[] dataRow in dataToUpload)
             {
@@ -682,10 +685,11 @@ public partial class Report
                 {
                     // If not a duplicate Primary Key error.
                     if (e.Number != 2627) throw;
+                    else ++duplicateInsertionCount;
                 }
             }
             transaction.Commit();
-            if (!uploadingIceData) CurrentStatus = successfullyInsertedRecords ? ReportStatusCode.Updated : ReportStatusCode.Failure;
+            if (!uploadingIceData) CurrentStatus = successfullyInsertedRecords ? ReportStatusCode.Updated : (duplicateInsertionCount == dataToUpload.Count) ? ReportStatusCode.OnlyDuplicateRecordsInUpdate : ReportStatusCode.Failure;
         }
         catch (Exception)
         {
@@ -993,7 +997,20 @@ public partial class Report
         cmd.CommandText = sql;
         return await cmd.ExecuteScalarAsync().ConfigureAwait(false);
     }
+    private async Task CreateReportTableIfMissingAsync()
+    {
+        using var tableCMD = s_databaseConnection!.CreateCommand();
+        tableCMD.CommandText = $"SELECT COUNT(name) FROM sys.Tables WHERE name =@name";
+        tableCMD.Parameters.AddWithValue("@name", _tableNameWithinDatabase);
 
+        bool? reportTableExists = (await tableCMD.ExecuteScalarAsync().ConfigureAwait(false))?.Equals(1);
+
+        if (!(reportTableExists ??= false))
+        {
+            string sql = await CreateReportTableSQLAsync().ConfigureAwait(false);
+            await ExecuteNonQuery(sql).ConfigureAwait(false);
+        }
+    }
     /// <summary>
     /// Queries the CFTC API and filters for the displayed headers.
     /// </summary>
@@ -1061,7 +1078,7 @@ public partial class Report
             else
             {
                 int size;
-                if (name.Contains("market_and_exchange_names"))
+                if (name.Equals("market_and_exchange_names"))
                 {
                     size = 100;
                 }
