@@ -9,8 +9,9 @@ using Microsoft.Data.SqlClient;
 using System.Data;
 using System.Text.Json.Nodes;
 using System.Text;
+using System.Text.Json;
 
-//using System.Configuration;
+//using System.Configuration; .. use to store connection string?
 
 public enum ReportType
 {
@@ -18,7 +19,8 @@ public enum ReportType
 }
 public enum ReportStatusCode
 {
-    NoUpdateAvailable, Updated, Failure, AttemptingRetrieval, AttemptingUpdate, NotInitialized, CheckingDataAvailability, OnlyDuplicateRecordsInUpdate, LockingInstanceFailure
+    NoUpdateAvailable, Updated, Failure, AttemptingRetrieval, AttemptingUpdate, NotInitialized, CheckingDataAvailability,
+    OnlyDuplicateRecordsInUpdate, LockingInstanceFailure, FoundNewData
 }
 
 public partial class Report
@@ -99,6 +101,20 @@ public partial class Report
     private static SqlConnection? s_databaseConnection;
 
     /// <summary>
+    /// Boolean used to control whether or not an instance where <see cref="IsLegacyCombined"/> = <see langword="false"/> can be released from its waiting loop.
+    /// </summary>
+    public bool ReleaseLockedInstances
+    {
+        get => s_releaseLockedInstances;
+        private set
+        {
+            if (IsLegacyCombined) s_releaseLockedInstances = value;
+        }
+    }
+
+    private static bool s_releaseLockedInstances = false;
+
+    /// <summary>
     /// Static variable to track changes done to Legacy_Combined instances.
     /// </summary>
     /// <remarks>Used to escape waiting loop in RetrieveDataAsync for non Legacy Combined data.</remarks>
@@ -118,7 +134,7 @@ public partial class Report
     /// <summary>
     /// Connection string used to connect to the SQL Server database.
     /// </summary> 
-    private const string DatabaseConnectionString = "Data Source=.\\SQLEXPRESS01;Trusted_Connection=True;TrustServerCertificate=True;MultipleActiveResultSets=True;Connection Timeout=20";
+    private const string DatabaseConnectionString = "Data Source=.\\SQLEXPRESS01;Trusted_Connection=True;TrustServerCertificate=True;MultipleActiveResultSets=True;Connection Timeout=30";
 
     /// <summary>
     ///  Gets a boolean value that represents if the current instance is Legacy Combined data.
@@ -237,8 +253,6 @@ public partial class Report
         }
     }
 
-
-
     /// <summary>
     /// Retrieves related data from api and uploads to a local database if new data is retrieved.
     /// </summary>
@@ -262,9 +276,7 @@ public partial class Report
             await CreateReportTableIfMissingAsync().ConfigureAwait(false);
 
             DatabaseDateBeforeUpdate = DatabaseDateAfterUpdate = await GetLatestTableDateAsync(filterForIce: false).ConfigureAwait(false);
-
-            CurrentStatus = ReportStatusCode.CheckingDataAvailability;
-
+            bool checkIceOnly = false;
             if (!DebugActive)
             {
                 // Wait until after the Legacy_Combined instance has attempted CFTC retrieval before continuing.
@@ -272,7 +284,7 @@ public partial class Report
                 {
                     // Loop until a change in state is detected in the running Legacy Combined instance.
                     ActionTimer.Stop();
-                    while (s_retrievalLockingStatusCode == ReportStatusCode.CheckingDataAvailability)
+                    while (!ReleaseLockedInstances)
                     {
                         await Task.Delay(300).ConfigureAwait(false);
                     }
@@ -282,8 +294,9 @@ public partial class Report
                     if (failureCodes.Contains(s_retrievalLockingStatusCode) && DatabaseDateBeforeUpdate >= s_retrievalLockingDate)
                     {
                         // If lockin instance failed then use the appropriate enum else assign no update available.
-                        CurrentStatus = s_retrievalLockingStatusCode == ReportStatusCode.Failure ? ReportStatusCode.LockingInstanceFailure : ReportStatusCode.NoUpdateAvailable;
-                        return;
+                        CurrentStatus = (s_retrievalLockingStatusCode == ReportStatusCode.Failure) ? ReportStatusCode.LockingInstanceFailure : ReportStatusCode.NoUpdateAvailable;
+                        checkIceOnly = CurrentStatus == ReportStatusCode.NoUpdateAvailable && QueriedReport == ReportType.Disaggregated;
+                        if (!checkIceOnly) return;
                     }
                     ActionTimer.Start();
                 }
@@ -293,71 +306,86 @@ public partial class Report
                 }
             }
 
-            int queryReturnLimit = DebugActive ? 10 : 20_000;
+            bool permitUpload = !DebugActive || testUpload;
+            var tasksToWaitFor = new List<Task>();
+            int queryReturnLimit = DebugActive ? 1_000 : 20_000;
             // Headers from local database.
             List<string> databaseFieldNames = await QueryDatabaseFieldNamesAsync().ConfigureAwait(false);
-            // Dictionary to keep track of wanted date and contract code combinations. 
-            Dictionary<string, Dictionary<DateTime, string?>> priceByDateByContractCode = new();
+
             // (New data from API, Mapped FieldInfo instances for each column or null)
-            (List<string[]> cftcData, Dictionary<string, FieldInfo>? cftcFieldInfoByEditedName) = await CftcCotRetrievalAsync(queryReturnLimit, priceByDateByContractCode, databaseFieldNames).ConfigureAwait(false);
+            Task<(List<string[]>, Dictionary<string, FieldInfo>?, Dictionary<string, Dictionary<DateTime, decimal?>>)>? cftcRetrievalTask = null;
 
-            List<string[]>? iceData = null;
-
-            var tasksToWaitFor = new List<Task>();
-
-            if (cftcData.Any() && cftcFieldInfoByEditedName is not null)
+            if (!checkIceOnly)
             {
-                // Only retrieve price data for Legacy Combined instances since it encompases both Disaggregated and Traders in Financial Futures reports.
-                if (IsLegacyCombined && userAllowsPriceDownload && (priceByDateByContractCode?.Any() ?? false))
-                {
-                    bool retrievePrices = true;
-                    if (DebugActive)
-                    {
-                        Console.WriteLine("Do you want to test price retrieval(Y/N)?");
-                        var keyResponse = Console.ReadKey(true);
-                        if (keyResponse.Key != ConsoleKey.Y) retrievePrices = false;
-                    }
+                cftcRetrievalTask = CftcCotRetrievalAsync(queryReturnLimit, databaseFieldNames);
+                tasksToWaitFor.Add(cftcRetrievalTask);
+            }
+            Task<List<string[]>?>? iceRetrievalTask = null;
+            // Retrieve and upload ICE data.
+            if (QueriedReport == ReportType.Disaggregated)
+            {
+                // await cftc retrieval if not just checking ICE as DatabaseDateAfterUpdate may update.
+                if (!checkIceOnly && cftcRetrievalTask != null) await cftcRetrievalTask.ConfigureAwait(false);
 
-                    if (retrievePrices)
+                iceRetrievalTask = IceCotRetrievalAsync(DatabaseDateAfterUpdate, databaseFieldNames, queryReturnLimit);
+                tasksToWaitFor.Add(iceRetrievalTask);
+            }
+
+            while (tasksToWaitFor.Any())
+            {
+                Task completedTask = await Task.WhenAny(tasksToWaitFor).ConfigureAwait(false);
+
+                if (completedTask == cftcRetrievalTask)
+                {
+                    (var cftcData, var cftcFieldInfoByEditedName, var priceByDateByContractCode) = await cftcRetrievalTask;
+
+                    if (cftcData.Any() && cftcFieldInfoByEditedName is not null)
                     {
-                        tasksToWaitFor.Add(RetrieveYahooPriceDataAsync(yahooPriceSymbolByContractCode!, priceByDateByContractCode).ContinueWith(x => UploadPriceDataAsync(priceByDateByContractCode)));
+                        // Only retrieve price data for Legacy Combined instances since it encompases both Disaggregated and Traders in Financial Futures reports.
+                        if (IsLegacyCombined && userAllowsPriceDownload && (priceByDateByContractCode?.Any() ?? false))
+                        {
+                            bool retrievePrices = true;
+                            if (DebugActive)
+                            {
+                                Console.WriteLine("Do you want to test price retrieval(Y/N)?");
+                                var keyResponse = Console.ReadKey(true);
+                                retrievePrices = keyResponse.Key == ConsoleKey.Y;
+                            }
+
+                            if (retrievePrices)
+                            {
+                                tasksToWaitFor.Add(RetrieveAndUploadYahooPriceDataAsync(yahooPriceSymbolByContractCode!, priceByDateByContractCode));
+                            }
+                        }
+
+                        if (permitUpload)
+                        {
+                            // Make an attempt to upload CFTC data.
+                            tasksToWaitFor.Add(UploadToDatabaseAsync(fieldInfoPerEditedName: cftcFieldInfoByEditedName, dataToUpload: cftcData, false));
+                        }
                     }
                 }
-
-                bool permitUpload = !DebugActive || testUpload;
-
-                if (permitUpload)
+                else if (completedTask == iceRetrievalTask)
                 {
-                    // Make an attempt to upload CFTC data.
-                    tasksToWaitFor.Add(UploadToDatabaseAsync(fieldInfoPerEditedName: cftcFieldInfoByEditedName, dataToUpload: cftcData, false));
-                }
-
-                if (QueriedReport == ReportType.Disaggregated)
-                {
-                    // DatabaseDateBeforeUpdate is assigned a value in CftcCotRetrievalAsync().
-                    iceData = await IceCotRetrievalAsync(DatabaseDateBeforeUpdate, databaseFieldNames, queryReturnLimit).ConfigureAwait(false);
-
-                    if (permitUpload && s_iceColumnMap != null && (iceData?.Any() ?? false))
+                    try
                     {
-                        try
-                        {   // Make an attempt to upload ICE data.
+                        var iceData = await iceRetrievalTask;
+                        if (permitUpload && s_iceColumnMap != null && (iceData?.Any() ?? false))
+                        {
                             tasksToWaitFor.Add(UploadToDatabaseAsync(fieldInfoPerEditedName: s_iceColumnMap, dataToUpload: iceData, true));
                         }
-                        catch (Exception e)
-                        {   // ICE is low priority so just print the error.
-                            Console.WriteLine(e);
-                        }
+                    }
+                    catch (Exception e1)
+                    {
+                        Console.WriteLine(e1);
                     }
                 }
-
-                if (tasksToWaitFor.Any())
+                else
                 {
-                    await Task.WhenAll(tasksToWaitFor).ConfigureAwait(false);
+                    // Will Throw errors if any.
+                    await completedTask;
                 }
-            }
-            else
-            {
-                CurrentStatus = ReportStatusCode.NoUpdateAvailable;
+                tasksToWaitFor.Remove(completedTask);
             }
         }
         catch (Exception)
@@ -369,6 +397,7 @@ public partial class Report
         finally
         {
             ActionTimer.Stop();
+            ReleaseLockedInstances = true;
         }
     }
 
@@ -383,7 +412,7 @@ public partial class Report
     /// <exception cref="HttpRequestException">Thrown if an error occurs while attempting to access the CFTC API.</exception>
     /// <exception cref="KeyNotFoundException">Thrown if an unknown key is used to access the fieldInfoByEditedName dictionary.</exception>
     /// <exception cref="NullReferenceException">Thrown if an attempt to use a null value from fieldInfoByEditedName dictionary.</exception>
-    private async Task<(List<string[]>, Dictionary<string, FieldInfo>?)> CftcCotRetrievalAsync(int maxRecordsPerLoop, Dictionary<string, Dictionary<DateTime, string?>> priceByDateByContractCode, List<string> databaseFieldNames)
+    private async Task<(List<string[]>, Dictionary<string, FieldInfo>?, Dictionary<string, Dictionary<DateTime, decimal?>>)> CftcCotRetrievalAsync(int maxRecordsPerLoop, List<string> databaseFieldNames)
     {
         // https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types
         const string WantedDataFormat = ".csv", MimeType = "text/csv";
@@ -399,20 +428,29 @@ public partial class Report
         List<string[]> newCftcData = new();
         // Dictionary will hold mapped FieldInfo instances for fields within the API and local database.
         Dictionary<string, FieldInfo>? fieldInfoByEditedName = null;
+        Dictionary<string, Dictionary<DateTime, decimal?>> priceByDateByContractCode = new();
 
         string comparisonOperator = DebugActive ? ">=" : ">";
         // Make initial API call to find out how many new records are available. Executed only once.
         var countRecordsUrl = $"{_cftcApiCode}{WantedDataFormat}?$select=count(id)&$where={StandardDateFieldName}{comparisonOperator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'";
 
+        CurrentStatus = ReportStatusCode.CheckingDataAvailability;
+
         string? response = await s_cftcApiClient.GetStringAsync(countRecordsUrl).ConfigureAwait(false);
 
         remainingRecordsToRetrieve = int.Parse(response.Split('\n')[1].Trim(s_charactersToTrim), NumberStyles.Number, null);
 
-        if (remainingRecordsToRetrieve > 0 && DebugActive)
+        if (remainingRecordsToRetrieve > 0)
         {
-            remainingRecordsToRetrieve = Math.Min(maxRecordsPerLoop, remainingRecordsToRetrieve);
+            if (DebugActive) remainingRecordsToRetrieve = Math.Min(maxRecordsPerLoop, remainingRecordsToRetrieve);
+            CurrentStatus = ReportStatusCode.FoundNewData;
+        }
+        else
+        {
+            CurrentStatus = ReportStatusCode.NoUpdateAvailable;
         }
 
+        ReleaseLockedInstances = true;
         while (remainingRecordsToRetrieve > 0)
         {
             CurrentStatus = ReportStatusCode.AttemptingRetrieval;
@@ -443,7 +481,7 @@ public partial class Report
                         if (IsLegacyCombined)
                         {
                             string currentContractCode = apiRecord[cftcCodeColumn];
-                            if (!priceByDateByContractCode.TryGetValue(currentContractCode, out Dictionary<DateTime, string?>? priceByDateForContractCode))
+                            if (!priceByDateByContractCode.TryGetValue(currentContractCode, out Dictionary<DateTime, decimal?>? priceByDateForContractCode))
                             {
                                 priceByDateForContractCode = priceByDateByContractCode[currentContractCode] = new();
                             }
@@ -456,7 +494,7 @@ public partial class Report
             }
             responseLines = null;
         };
-        return (newCftcData, fieldInfoByEditedName);
+        return (newCftcData, fieldInfoByEditedName, priceByDateByContractCode);
     }
 
     /// <summary>
@@ -502,8 +540,7 @@ public partial class Report
             await Task.Delay(300).ConfigureAwait(false);
         }
 
-        await Task.WhenAll(s_iceCsvRawData.Values!);
-        int futOrCombinedColumn = s_iceColumnMap!["futonly_or_combined"].ColumnIndex;
+        await Task.WhenAll(s_iceCsvRawData.Values!).ConfigureAwait(false);
         // Filter for data relevant to the current instance and is more recent than what is stored in the database.
         var iceQuery = from kvp in s_iceCsvRawData
                        let weeklyTaskLocated = kvp.Key.Equals(WeeklyIceKey)
@@ -511,7 +548,8 @@ public partial class Report
                        from recordsByDateTime in kvp.Value.Result
                        where (!DebugActive && recordsByDateTime.Key > maxIceDateInDatabase) || (DebugActive && recordsByDateTime.Key >= maxIceDateInDatabase)
                        from row in recordsByDateTime.Value
-                       where row[futOrCombinedColumn].Equals(RetrieveCombinedData ? "combined" : "futonly", StringComparison.InvariantCultureIgnoreCase)
+                       let oiTypeColumnIndex = row.Length - 1
+                       where row[oiTypeColumnIndex].Equals(RetrieveCombinedData ? "combined" : "futonly", StringComparison.InvariantCultureIgnoreCase)
                        select row;
 
         return DebugActive ? iceQuery.Take(debugReturnLimit).ToList() : iceQuery.ToList();
@@ -541,29 +579,40 @@ public partial class Report
             bool foundHeaders = false;
             using HttpContent content = response.Content;
             using var stream = (MemoryStream)await content.ReadAsStreamAsync().ConfigureAwait(false);
-            using var sr = new StreamReader(stream);
+            using var iceStreamReader = new StreamReader(stream);
             int iceDateColumn = -1;
             const string IceShortDateFormat = "yyMMdd";
-            while (!sr.EndOfStream)
+            while (!iceStreamReader.EndOfStream)
             {
                 string[]? iceCsvRecord;
 
                 try
                 {
-                    iceCsvRecord = SplitOnCommaNotWithinQuotesRegex().Split(await sr.ReadLineAsync().ConfigureAwait(false) ?? throw new NullReferenceException("Empty iceCsvRecord"));
+                    iceCsvRecord = SplitOnCommaNotWithinQuotesRegex().Split(await iceStreamReader.ReadLineAsync().ConfigureAwait(false) ?? throw new NullReferenceException("Empty iceCsvRecord"));
                 }
                 catch (NullReferenceException)
                 {
                     continue;
                 }
+                catch (HttpRequestException e)
+                {
+                    Console.WriteLine(e);
+                    throw;
+                }
 
                 if (!foundHeaders)
                 {
-                    foundHeaders = true;
                     s_iceColumnMap ??= MapHeaderFieldsToDatabase(iceCsvRecord, databaseHeaders, true);
-                    iceDateColumn = s_iceColumnMap[$"@{StandardDateFieldName}"].ColumnIndex!;
-
-                    iceShortDateColumn = s_iceColumnMap.First(x => x.Key.Contains(IceShortDateFormat, StringComparison.InvariantCultureIgnoreCase)).Value.ColumnIndex!;
+                    if (s_iceColumnMap.Any())
+                    {
+                        iceDateColumn = s_iceColumnMap[$"@{StandardDateFieldName}"].ColumnIndex!;
+                        iceShortDateColumn = iceDateColumn - 1;
+                        foundHeaders = true;
+                    }
+                    else
+                    {
+                        throw new Exception($"{nameof(s_iceColumnMap)} contains no key-value pairs.");
+                    }
                 }
                 else if (DateTime.TryParseExact(iceCsvRecord[iceShortDateColumn], IceShortDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces, out DateTime parsedDate))
                 {
@@ -584,34 +633,36 @@ public partial class Report
     /// <summary>
     /// Uploads price data to the PriceData table.
     /// </summary>
-    /// <param name="priceDataByDateByContractCode">Dictionary that contains data to upload.</param>
+    /// <param name="priceByDateByContractCode">Dictionary that contains data to upload.</param>
     /// <returns>Async Task.</returns>
-    static async Task UploadPriceDataAsync(Dictionary<string, Dictionary<DateTime, string?>> priceDataByDateByContractCode)
+    static async Task UploadPriceDataAsync(Dictionary<string, Dictionary<DateTime, decimal?>> priceByDateByContractCode)
     {
-        SqlCommand cmd = new SqlCommandBuilder(new SqlDataAdapter($"Select * From PriceData", s_databaseConnection!)).GetInsertCommand(true);
-
-        SqlParameter ccParameter = cmd.Parameters[$"@{ContractCodeColumnName}"];
-        SqlParameter dateParameter = cmd.Parameters[$"@{StandardDateFieldName}"];
-        SqlParameter priceParameter = cmd.Parameters["@Price"];
-
-        foreach (string contractCode in priceDataByDateByContractCode.Keys)
+        if (s_databaseConnection != null)
         {
-            ccParameter.Value = contractCode;
-            foreach (DateTime onDate in priceDataByDateByContractCode[contractCode].Keys)
+            SqlCommand cmd = new SqlCommandBuilder(new SqlDataAdapter($"Select * From PriceData", s_databaseConnection!)).GetInsertCommand(true);
+
+            SqlParameter contractCodeParameter = cmd.Parameters[$"@{ContractCodeColumnName}"];
+            SqlParameter dateParameter = cmd.Parameters[$"@{StandardDateFieldName}"];
+            SqlParameter priceParameter = cmd.Parameters["@price"];
+
+            foreach (var codeAndDictKvp in priceByDateByContractCode)
             {
-                string? fieldValue = priceDataByDateByContractCode[contractCode][onDate];
-                if (!string.IsNullOrEmpty(fieldValue))
+                contractCodeParameter.Value = codeAndDictKvp.Key;
+                foreach (var kvpInner in codeAndDictKvp.Value)
                 {
-                    dateParameter.Value = onDate;
-                    priceParameter.Value = decimal.Parse(fieldValue);
-                    try
+                    if (kvpInner.Value != null)
                     {
-                        await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
-                    }
-                    catch (SqlException e)
-                    {
-                        // Throw if not primary key violation.
-                        if (e.Number != 2627) throw;
+                        dateParameter.Value = kvpInner.Key;
+                        priceParameter.Value = kvpInner.Value;
+                        try
+                        {
+                            await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+                        }
+                        catch (SqlException e)
+                        {
+                            // Throw if not primary key violation.
+                            if (e.Number != 2627) throw;
+                        }
                     }
                 }
             }
@@ -636,8 +687,8 @@ public partial class Report
         SqlTransaction? transaction = null;
         try
         {
-            await conn.OpenAsync();
-            await conn.ChangeDatabaseAsync(DatabaseName);
+            await conn.OpenAsync().ConfigureAwait(false);
+            await conn.ChangeDatabaseAsync(DatabaseName).ConfigureAwait(false);
             using SqlCommand cmd = new SqlCommandBuilder(new SqlDataAdapter($"Select * From {_tableNameWithinDatabase}", conn)).GetInsertCommand(true);
             transaction = conn.BeginTransaction();
             cmd.Transaction = transaction;
@@ -650,10 +701,7 @@ public partial class Report
                 {
                     string? fieldValue = fieldInfoPerEditedName.TryGetValue(param.ParameterName, out FieldInfo knownField) ? dataRow[knownField.ColumnIndex] : null;
 
-                    if (string.IsNullOrEmpty(fieldValue))
-                    {
-                        param.Value = DBNull.Value;
-                    }
+                    if (string.IsNullOrEmpty(fieldValue)) param.Value = DBNull.Value;
                     else
                     {
                         param.Value = param.SqlDbType switch
@@ -687,22 +735,19 @@ public partial class Report
         }
         catch (Exception)
         {
-            if (transaction is not null)
+            try
             {
-                try
-                {
-                    transaction.Rollback();
-                }
-                catch (Exception ex2)
-                {
-                    Console.WriteLine("Rollback Exception Type: {0}\n Message: {1}", ex2.GetType(), ex2.Message);
-                }
-                transaction.Dispose();
+                transaction?.Rollback();
+            }
+            catch (Exception ex2)
+            {
+                Console.WriteLine("Rollback Exception Type: {0}\n Message: {1}", ex2.GetType(), ex2.Message);
             }
             throw;
         }
         finally
         {
+            transaction?.Dispose();
             if (conn.State == ConnectionState.Open) conn.Close();
         }
     }
@@ -713,25 +758,24 @@ public partial class Report
     /// <param name="yahooPriceSymbolByContractCode">Dictionary of price symbols keyed to cftc contract codes.</param>
     /// <param name="priceByDateByContractCode">A contract code keyed dictionary that contains a dictionary keyed to wanted dates for the given contract code.</param>
     /// <returns>An asynchronous task.</returns>
-    static async Task RetrieveYahooPriceDataAsync(Dictionary<string, string> yahooPriceSymbolByContractCode, Dictionary<string, Dictionary<DateTime, string?>> priceByDateByContractCode)
+    static async Task RetrieveAndUploadYahooPriceDataAsync(Dictionary<string, string> yahooPriceSymbolByContractCode, Dictionary<string, Dictionary<DateTime, decimal?>> priceByDateByContractCode)
     {
-        using HttpClient priceRetrievalClient = new() { BaseAddress = new Uri("https://query1.finance.yahoo.com/v7/finance/download/") };
+        using HttpClient priceRetrievalClient = new() { BaseAddress = new Uri("https://query1.finance.yahoo.com/v8/finance/chart/") };
         var headers = priceRetrievalClient.DefaultRequestHeaders;
-        headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/csv"));
+        //headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/csv"));
         headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0");
 
-        const byte YahooDateColumn = 0, YahooCloseColumn = 5;
-
+        // const byte YahooDateColumn = 0, YahooCloseColumn = 5;
+        bool dataFound = false;
         foreach (var knownSymbol in yahooPriceSymbolByContractCode)
         {
-            if (priceByDateByContractCode.TryGetValue(knownSymbol.Key, out Dictionary<DateTime, string?>? wantedPrices))
+            if (priceByDateByContractCode.TryGetValue(knownSymbol.Key, out Dictionary<DateTime, decimal?>? priceByDate))
             {
-                var startDate = (long)wantedPrices.Keys.Min().Subtract(DateTime.UnixEpoch).TotalSeconds;
-                var endDate = (long)wantedPrices.Keys.Max().AddDays(1).Subtract(DateTime.UnixEpoch).TotalSeconds;
+                var startDate = (long)priceByDate.Keys.Min().Subtract(DateTime.UnixEpoch).TotalSeconds;
+                var endDate = (long)priceByDate.Keys.Max().AddDays(1).Subtract(DateTime.UnixEpoch).TotalSeconds;
 
                 string urlDetails = $"{knownSymbol.Value}?period1={startDate}&period2={endDate}&interval=1d&events=history&includeAdjustedClose=true";
                 string response;
-
                 try
                 {
                     response = await priceRetrievalClient.GetStringAsync(urlDetails).ConfigureAwait(false);
@@ -740,18 +784,38 @@ public partial class Report
                 {
                     continue;
                 }
-                string[] queriedResults = response.Trim(s_charactersToTrim).Split('\n');
 
-                for (var i = 1; i < queriedResults.Length; ++i)
+                if (response.Contains("timestamp"))
                 {
-                    string[] priceData = queriedResults[i].Split(',');
-                    if (DateTime.TryParseExact(priceData[YahooDateColumn], "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime parsedDate) && wantedPrices.ContainsKey(parsedDate))
+                    try
                     {
-                        wantedPrices[parsedDate] = priceData[YahooCloseColumn];
+                        uint?[]? unixDates = JsonSerializer.Deserialize<uint?[]?>(response.Split("\"timestamp\":")[1].Split(']')[0] + ']')!;
+                        decimal?[]? adjustedClose = JsonSerializer.Deserialize<decimal?[]?>(response.Split("\"adjclose\":")[2].Split(']')[0] + ']')!;
+
+                        if (unixDates != null && adjustedClose != null)
+                        {
+                            for (var i = 0; i < unixDates.Length; ++i)
+                            {
+                                if (unixDates[i] != null)
+                                {
+                                    var queryDate = DateTime.UnixEpoch.AddSeconds((double)unixDates[i]!).Date;
+                                    if (priceByDate.ContainsKey(queryDate) && adjustedClose[i] != null)
+                                    {
+                                        priceByDate[queryDate] = adjustedClose[i];
+                                        dataFound = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch (IndexOutOfRangeException)
+                    {
+                        continue;
                     }
                 }
             }
         }
+        if (dataFound) await UploadPriceDataAsync(priceByDateByContractCode);
     }
 
     /// <summary>
@@ -759,6 +823,7 @@ public partial class Report
     /// </summary>
     /// <param name="filterForIce"><see langword="true"/> if the latest date for ICE data should be returned; otherwise, <see langword="false"/>.</param>
     /// <returns>The most recent DateTime found in the <see cref="StandardDateFieldName"/> column within the database.</returns>
+    /// <exception cref="InvalidOperationException">Thrown if filtering for ICE contracts but instance isn't for the Disaggregated report.</exception>
     async Task<DateTime> GetLatestTableDateAsync(bool filterForIce)
     {
         if (filterForIce && QueriedReport != ReportType.Disaggregated)
@@ -803,12 +868,11 @@ public partial class Report
 
         using var reader = await cmd.ExecuteReaderAsync().ConfigureAwait(false);
 
-        List<string> fieldNames = (from columnSchema in await reader.GetColumnSchemaAsync()
+        List<string> fieldNames = (from columnSchema in await reader.GetColumnSchemaAsync().ConfigureAwait(false)
                                    let fieldName = columnSchema.ColumnName
                                    select fieldName).ToList();
 
         await reader.CloseAsync().ConfigureAwait(false);
-
         return fieldNames;
     }
 
@@ -822,6 +886,7 @@ public partial class Report
             if (s_databaseConnection.State == ConnectionState.Open) s_databaseConnection.Close();
             s_databaseConnection.Dispose();
             s_databaseConnection = null;
+            s_cftcApiClient.Dispose();
         }
     }
 
@@ -861,22 +926,14 @@ public partial class Report
         Dictionary<string, string> databaseFieldReplacements = new()
         {
             {" ","_"},{"\"",string.Empty},
-            {"%", "pct"},
-            {"=", "_"},
-            {"(", "_"},
-            {")", string.Empty},
-            {"-", "_"},
-            {"commercial", "comm"},
-            {"reportable", "rept"},
-            {"total", "tot"},
-            {"concentration", "conc"},
-            {"spreading", "spread"},
-            {"_lt_", "_le_"},
-            {"___","_"},
-            {"__", "_"},
-            { "open_interest_oi", "oi"},
-            { "open_interest", "oi"},
-            {"_in_initials",string.Empty}
+            {"%", "pct"},{"=", "_"},
+            {"(", "_"},{")", string.Empty},
+            {"-", "_"}, {"commercial", "comm"},
+            {"reportable", "rept"}, {"total", "tot"},
+            {"concentration", "conc"},{"spreading", "spread"},
+            {"_lt_", "_le_"},{"___","_"},
+            {"__", "_"},{ "open_interest_oi", "oi"},
+            { "open_interest", "oi"},{"_in_initials",string.Empty}
         };
         // <edited name , original name in database >
         Dictionary<string, string> originalFieldByEditedName = new();
@@ -897,7 +954,7 @@ public partial class Report
                 {   // Apply known substitutions.
                     foreach (var pair in databaseFieldReplacements)
                     {
-                        editedTableFieldName = editedTableFieldName.Replace(pair.Key, pair.Value);
+                        editedTableFieldName = editedTableFieldName.Replace(pair.Key, pair.Value, StringComparison.InvariantCultureIgnoreCase);
                     }
                 }
             }
@@ -905,7 +962,6 @@ public partial class Report
             if (editedTableFieldName.Equals("cftc_region_code") == false)
             {
                 originalFieldByEditedName.Add(editedTableFieldName, databaseFields[i]);
-                //fieldInfoByEditedName.Add(editedTableFieldName, null);
             }
         }
 
@@ -967,6 +1023,11 @@ public partial class Report
         }
         return fieldInfoByEditedName;
     }
+
+    /// <summary>
+    /// Creates a dictionary of relevant values used to summarize the current state of the instance.
+    /// </summary>
+    /// <returns>A dictionary of values using strings as a key.</returns>
     public Dictionary<string, object> Summarized()
     {
         return new Dictionary<string, object>(){
@@ -974,22 +1035,6 @@ public partial class Report
             {"Time Elapsed (ms)", ActionTimer.ElapsedMilliseconds},
             {"Status", (int)CurrentStatus}
         };
-    }
-    private static async Task ExecuteNonQuery(string sql)
-    {
-        if (s_databaseConnection!.State == ConnectionState.Closed) await s_databaseConnection.OpenAsync().ConfigureAwait(false);
-
-        using var cmd = s_databaseConnection.CreateCommand();
-        cmd.CommandText = sql;
-        await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
-    }
-    private static async Task<object?> ExecuteScalar(string sql)
-    {
-        if (s_databaseConnection!.State == ConnectionState.Closed) await s_databaseConnection.OpenAsync().ConfigureAwait(false);
-
-        using var cmd = s_databaseConnection.CreateCommand();
-        cmd.CommandText = sql;
-        return await cmd.ExecuteScalarAsync().ConfigureAwait(false);
     }
     private async Task CreateReportTableIfMissingAsync()
     {
@@ -999,10 +1044,11 @@ public partial class Report
 
         bool? reportTableExists = (await tableCMD.ExecuteScalarAsync().ConfigureAwait(false))?.Equals(1);
 
-        if (!(reportTableExists ??= false))
+        if (!(reportTableExists ?? false))
         {
-            string sql = await CreateReportTableSQLAsync().ConfigureAwait(false);
-            await ExecuteNonQuery(sql).ConfigureAwait(false);
+            tableCMD.Parameters.Clear();
+            tableCMD.CommandText = await CreateReportTableSQLAsync().ConfigureAwait(false);
+            await tableCMD.ExecuteNonQueryAsync().ConfigureAwait(false);
         }
     }
     /// <summary>
@@ -1020,12 +1066,10 @@ public partial class Report
         JsonArray columnInfo = root["columns"]!.AsArray();
         var columnsToDrop = "id,futonly_or_combined,commodity_name".Split(',');
         // The name field is selected for because it hasn't been renamed improperly.
-        var fieldNames = (from column in columnInfo
-                          let columnName = column["fieldName"]!.GetValue<string>()
-                          where !columnsToDrop.Any(columnName.Equals)
-                          select column["name"]!.GetValue<string>().ToLower().Replace(' ', '_'))!.ToArray();
-
-        return fieldNames;
+        return (from column in columnInfo
+                let columnName = column["fieldName"]!.GetValue<string>()
+                where !columnsToDrop.Any(columnName.Equals)
+                select column["name"]!.GetValue<string>().ToLower().Replace(' ', '_'))!.ToArray();
     }
     /// <summary>
     /// Builds an SQL command for the creation of a SQL Table for current instance.
@@ -1071,27 +1115,14 @@ public partial class Report
             }
             else
             {
-                int size;
-                if (name.Equals("market_and_exchange_names"))
+                int size = name switch
                 {
-                    size = 100;
-                }
-                else if (varChar10.Any(name.Equals))
-                {
-                    size = 10;
-                }
-                else if (name.Equals("yyyy_report_week_ww"))
-                {
-                    size = 19;
-                }
-                else if (name.Equals("contract_units"))
-                {
-                    size = 120;
-                }
-                else
-                {
-                    size = 70;
-                }
+                    "market_and_exchange_names" => 100,
+                    "yyyy_report_week_ww" => 19,
+                    "contract_units" => 120,
+                    string a when varChar10.Any(a.Equals) => 10,
+                    _ => 70
+                };
                 builder.Append($"{name} VARCHAR({size})");
             }
         }
@@ -1131,7 +1162,7 @@ public partial class Report
             ColumnIndex = columnIndex;
             ColumnName = columnName;
             EditedColumnName = editedColumnName;
-            ParamName = $"@{ColumnName}";
+            ParamName = $"@{columnName}";
         }
     }
 

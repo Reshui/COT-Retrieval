@@ -12,14 +12,16 @@ if (args.Length == 2 || args.Length == 0)
     Console.WriteLine($"Program started. {DateTime.UtcNow}\n");
     //string databaseString;
     string symbolInfoJson;
-    bool downloadPriceDate = false;
-    if (args.Length == 2)
+    bool downloadPriceData = true;
+    string? serverName;
+    if (args.Length >= 2)
     {
         if (debugMode) throw new InvalidOperationException($"{nameof(debugMode)} must be false to continue with command arguments");
         // Database path strings from Excel should already be formatted to use double \ 
         //databaseString = args[0];
         symbolInfoJson = args[0];
-        downloadPriceDate = int.Parse(args[1]) == -1;
+        downloadPriceData = int.Parse(args[1]) == -1;
+        serverName = args.Length > 2 ? args[2] : null;
     }
     else
     {
@@ -72,7 +74,7 @@ if (args.Length == 2 || args.Length == 0)
         {
             if (debugMode && false == (reportType == ReportType.Legacy && retrieveCombinedData == true)) continue;
             var reportInstance = new Report(reportType, retrieveCombinedData, debugMode);
-            updatingTasksByReport.Add(reportInstance, reportInstance.CommitmentsOfTradersRetrievalAndUploadAsync(reportInstance.IsLegacyCombined ? priceSymbolByContractCode : null, testUpload, downloadPriceDate));
+            updatingTasksByReport.Add(reportInstance, reportInstance.CommitmentsOfTradersRetrievalAndUploadAsync(reportInstance.IsLegacyCombined ? priceSymbolByContractCode : null, testUpload, downloadPriceData));
             if (debugMode) break;
         }
         //if (debugMode) break;
@@ -109,7 +111,7 @@ if (args.Length == 2 || args.Length == 0)
 
         innerDict.Add(instance.QueriedReport.ToString()[0], instance.Summarized());
 
-        string baseText = $"{instance.QueriedReport,-13}:{{Combined: {instance.RetrieveCombinedData,-5}, Time Elapsed: {instance.ActionTimer.ElapsedMilliseconds,-4}ms, Latest Date: {instance.DatabaseDateAfterUpdate:yyyy-MM-dd}, Status: {(int)instance.CurrentStatus}}}";
+        string baseText = $"{instance.QueriedReport,-13}:{{Combined: {instance.RetrieveCombinedData,-5}, Time Elapsed(ms): {instance.ActionTimer.ElapsedMilliseconds,-4}, Latest Date: {instance.DatabaseDateAfterUpdate:yyyy-MM-dd}, Status: {(int)instance.CurrentStatus}}}";
         outputText.AppendLine(baseText);
     }
 
