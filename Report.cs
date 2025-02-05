@@ -305,23 +305,22 @@ public partial class Report
                     s_retrievalLockingDate = DatabaseDateBeforeUpdate;
                 }
             }
-
-            bool permitUpload = !DebugActive || testUpload;
-            var tasksToWaitFor = new List<Task>();
-            int queryReturnLimit = DebugActive ? 1_000 : 20_000;
             // Headers from local database.
             List<string> databaseFieldNames = await QueryDatabaseFieldNamesAsync().ConfigureAwait(false);
 
             // (New data from API, Mapped FieldInfo instances for each column or null)
-            Task<(List<string[]>, Dictionary<string, FieldInfo>?, Dictionary<string, Dictionary<DateTime, decimal?>>)>? cftcRetrievalTask = null;
+            Task<(List<string[]>, Dictionary<string, FieldInfo>?, Dictionary<string, Dictionary<DateTime, decimal?>>?)>? cftcRetrievalTask = null;
+            var tasksToWaitFor = new List<Task>();
+            int queryReturnLimit = DebugActive ? 1_000 : 20_000;
 
             if (!checkIceOnly)
             {
                 cftcRetrievalTask = CftcCotRetrievalAsync(queryReturnLimit, databaseFieldNames);
                 tasksToWaitFor.Add(cftcRetrievalTask);
             }
+
             Task<List<string[]>?>? iceRetrievalTask = null;
-            // Retrieve and upload ICE data.
+
             if (QueriedReport == ReportType.Disaggregated)
             {
                 // await cftc retrieval if not just checking ICE as DatabaseDateAfterUpdate may update.
@@ -331,18 +330,21 @@ public partial class Report
                 tasksToWaitFor.Add(iceRetrievalTask);
             }
 
-            while (tasksToWaitFor.Any())
+            bool permitUpload = !DebugActive || testUpload;
+
+            while (tasksToWaitFor.Count != 0)
             {
                 Task completedTask = await Task.WhenAny(tasksToWaitFor).ConfigureAwait(false);
 
                 if (completedTask == cftcRetrievalTask)
                 {
-                    (var cftcData, var cftcFieldInfoByEditedName, var priceByDateByContractCode) = await cftcRetrievalTask;
+                    (var cftcData, var cftcFieldInfoByEditedName, var priceByDateByContractCode) = await cftcRetrievalTask.ConfigureAwait(false);
 
-                    if (cftcData.Any() && cftcFieldInfoByEditedName is not null)
+                    if (cftcData.Count != 0 && cftcFieldInfoByEditedName is not null)
                     {
                         // Only retrieve price data for Legacy Combined instances since it encompases both Disaggregated and Traders in Financial Futures reports.
-                        if (IsLegacyCombined && userAllowsPriceDownload && (priceByDateByContractCode?.Any() ?? false))
+
+                        if (yahooPriceSymbolByContractCode != null && IsLegacyCombined && userAllowsPriceDownload && (priceByDateByContractCode?.Count ?? 0) > 0)
                         {
                             bool retrievePrices = true;
                             if (DebugActive)
@@ -354,7 +356,7 @@ public partial class Report
 
                             if (retrievePrices)
                             {
-                                tasksToWaitFor.Add(RetrieveAndUploadYahooPriceDataAsync(yahooPriceSymbolByContractCode!, priceByDateByContractCode));
+                                tasksToWaitFor.Add(RetrieveAndUploadYahooPriceDataAsync(yahooPriceSymbolByContractCode, priceByDateByContractCode!));
                             }
                         }
 
@@ -369,10 +371,10 @@ public partial class Report
                 {
                     try
                     {
-                        var iceData = await iceRetrievalTask;
-                        if (permitUpload && s_iceColumnMap != null && (iceData?.Any() ?? false))
+                        var iceData = await iceRetrievalTask.ConfigureAwait(false);
+                        if (permitUpload && s_iceColumnMap != null && ((iceData?.Count ?? 0) > 0))
                         {
-                            tasksToWaitFor.Add(UploadToDatabaseAsync(fieldInfoPerEditedName: s_iceColumnMap, dataToUpload: iceData, true));
+                            tasksToWaitFor.Add(UploadToDatabaseAsync(fieldInfoPerEditedName: s_iceColumnMap, dataToUpload: iceData!, true));
                         }
                     }
                     catch (Exception e1)
@@ -381,9 +383,8 @@ public partial class Report
                     }
                 }
                 else
-                {
-                    // Will Throw errors if any.
-                    await completedTask;
+                {   // await task to catch any errors.
+                    await completedTask.ConfigureAwait(false);
                 }
                 tasksToWaitFor.Remove(completedTask);
             }
@@ -412,7 +413,7 @@ public partial class Report
     /// <exception cref="HttpRequestException">Thrown if an error occurs while attempting to access the CFTC API.</exception>
     /// <exception cref="KeyNotFoundException">Thrown if an unknown key is used to access the fieldInfoByEditedName dictionary.</exception>
     /// <exception cref="NullReferenceException">Thrown if an attempt to use a null value from fieldInfoByEditedName dictionary.</exception>
-    private async Task<(List<string[]>, Dictionary<string, FieldInfo>?, Dictionary<string, Dictionary<DateTime, decimal?>>)> CftcCotRetrievalAsync(int maxRecordsPerLoop, List<string> databaseFieldNames)
+    private async Task<(List<string[]>, Dictionary<string, FieldInfo>?, Dictionary<string, Dictionary<DateTime, decimal?>>?)> CftcCotRetrievalAsync(int maxRecordsPerLoop, List<string> databaseFieldNames)
     {
         // https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types
         const string WantedDataFormat = ".csv", MimeType = "text/csv";
@@ -425,10 +426,11 @@ public partial class Report
             acceptHeaders.Add(new MediaTypeWithQualityHeaderValue(MimeType));
         }
         // List will contain records cleared for database upload.
-        List<string[]> newCftcData = new();
+        List<string[]> newCftcData = [];
         // Dictionary will hold mapped FieldInfo instances for fields within the API and local database.
         Dictionary<string, FieldInfo>? fieldInfoByEditedName = null;
-        Dictionary<string, Dictionary<DateTime, decimal?>> priceByDateByContractCode = new();
+        // This Dictionary will price dictionaries keyed to each contracts contract code.
+        Dictionary<string, Dictionary<DateTime, decimal?>>? priceByDateByContractCode = IsLegacyCombined ? [] : null;
 
         string comparisonOperator = DebugActive ? ">=" : ">";
         // Make initial API call to find out how many new records are available. Executed only once.
@@ -473,7 +475,7 @@ public partial class Report
             {
                 if (!string.IsNullOrEmpty(responseLines[i]))
                 {
-                    string[] apiRecord = SplitOnCommaNotWithinQuotesRegex().Split(responseLines[i]).Select(x => x.Trim(s_charactersToTrim)).ToArray();
+                    string[] apiRecord = [.. SplitOnCommaNotWithinQuotesRegex().Split(responseLines[i]).Select(x => x.Trim(s_charactersToTrim))];
 
                     if (DateTime.TryParseExact(apiRecord[cftcDateColumn], StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime parsedDate)
                     && ((parsedDate > DatabaseDateBeforeUpdate && !DebugActive) || (parsedDate >= DatabaseDateBeforeUpdate && DebugActive)))
@@ -481,9 +483,9 @@ public partial class Report
                         if (IsLegacyCombined)
                         {
                             string currentContractCode = apiRecord[cftcCodeColumn];
-                            if (!priceByDateByContractCode.TryGetValue(currentContractCode, out Dictionary<DateTime, decimal?>? priceByDateForContractCode))
+                            if (!priceByDateByContractCode!.TryGetValue(currentContractCode, out Dictionary<DateTime, decimal?>? priceByDateForContractCode))
                             {
-                                priceByDateForContractCode = priceByDateByContractCode[currentContractCode] = new();
+                                priceByDateForContractCode = priceByDateByContractCode[currentContractCode] = [];
                             }
                             priceByDateForContractCode.TryAdd(parsedDate, null);
                         }
@@ -493,7 +495,8 @@ public partial class Report
                 }
             }
             responseLines = null;
-        };
+        }
+        ;
         return (newCftcData, fieldInfoByEditedName, priceByDateByContractCode);
     }
 
@@ -552,7 +555,7 @@ public partial class Report
                        where row[oiTypeColumnIndex].Equals(RetrieveCombinedData ? "combined" : "futonly", StringComparison.InvariantCultureIgnoreCase)
                        select row;
 
-        return DebugActive ? iceQuery.Take(debugReturnLimit).ToList() : iceQuery.ToList();
+        return DebugActive ? [.. iceQuery.Take(debugReturnLimit)] : [.. iceQuery];
     }
 
     /// <summary>
@@ -603,7 +606,7 @@ public partial class Report
                 if (!foundHeaders)
                 {
                     s_iceColumnMap ??= MapHeaderFieldsToDatabase(iceCsvRecord, databaseHeaders, true);
-                    if (s_iceColumnMap.Any())
+                    if (s_iceColumnMap.Count != 0)
                     {
                         iceDateColumn = s_iceColumnMap[$"@{StandardDateFieldName}"].ColumnIndex!;
                         iceShortDateColumn = iceDateColumn - 1;
@@ -616,12 +619,12 @@ public partial class Report
                 }
                 else if (DateTime.TryParseExact(iceCsvRecord[iceShortDateColumn], IceShortDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces, out DateTime parsedDate))
                 {
-                    iceCsvRecord = iceCsvRecord.Select(x => x.Trim(s_charactersToTrim)).ToArray();
+                    iceCsvRecord = [.. iceCsvRecord.Select(x => x.Trim(s_charactersToTrim))];
                     iceCsvRecord[iceDateColumn] = parsedDate.ToString(StandardDateFormat);
 
                     if (!csvDataByDateTime.TryGetValue(parsedDate, out List<string[]>? dataGroupedByDate))
                     {
-                        dataGroupedByDate = csvDataByDateTime[parsedDate] = new();
+                        dataGroupedByDate = csvDataByDateTime[parsedDate] = [];
                     }
                     dataGroupedByDate.Add(iceCsvRecord);
                 }
@@ -815,7 +818,7 @@ public partial class Report
                 }
             }
         }
-        if (dataFound) await UploadPriceDataAsync(priceByDateByContractCode);
+        if (dataFound) await UploadPriceDataAsync(priceByDateByContractCode).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -900,9 +903,9 @@ public partial class Report
     static Dictionary<string, FieldInfo> MapHeaderFieldsToDatabase(string[] externalHeaders, List<string> databaseFields, bool iceHeaders)
     {
         // return dictionary keyed to fields within databaseFields with wanted FieldInfo structs as a value 
-        Dictionary<string, FieldInfo> fieldInfoByEditedName = new();
+        Dictionary<string, FieldInfo> fieldInfoByEditedName = [];
         // Dictionary keyed to api header names with their 0 based column number.
-        Dictionary<string, int> headerIndexesByEditedName = new();
+        Dictionary<string, int> headerIndexesByEditedName = [];
 
         // Editing externalHeaders for alignment.
         for (var i = 0; i < externalHeaders.Length; ++i)
@@ -910,10 +913,10 @@ public partial class Report
             var header = externalHeaders[i].ToLower();
             if (!iceHeaders)
             {
-                header = header.Replace("spead", "spread");
-                header = header.Replace("postions", "positions");
-                header = header.Replace("open_interest", "oi");
-                header = header.Replace("__", "_");
+                if (header.Contains("spead")) header = header.Replace("spead", "spread");
+                if (header.Contains("postions")) header = header.Replace("postions", "positions");
+                if (header.Contains("open_interest")) header = header.Replace("open_interest", "oi");
+                if (header.Contains("__")) header = header.Replace("__", "_");
                 externalHeaders[i] = header.Replace("\"", string.Empty);
             }
             else
@@ -936,7 +939,7 @@ public partial class Report
             { "open_interest", "oi"},{"_in_initials",string.Empty}
         };
         // <edited name , original name in database >
-        Dictionary<string, string> originalFieldByEditedName = new();
+        Dictionary<string, string> originalFieldByEditedName = [];
 
         // Edit database column names for alignment.
         for (var i = 0; i < databaseFields.Count; ++i)
@@ -954,7 +957,7 @@ public partial class Report
                 {   // Apply known substitutions.
                     foreach (var pair in databaseFieldReplacements)
                     {
-                        editedTableFieldName = editedTableFieldName.Replace(pair.Key, pair.Value, StringComparison.InvariantCultureIgnoreCase);
+                        if (editedTableFieldName.Contains(pair.Key)) editedTableFieldName = editedTableFieldName.Replace(pair.Key, pair.Value, StringComparison.InvariantCultureIgnoreCase);
                     }
                 }
             }
@@ -1066,10 +1069,10 @@ public partial class Report
         JsonArray columnInfo = root["columns"]!.AsArray();
         var columnsToDrop = "id,futonly_or_combined,commodity_name".Split(',');
         // The name field is selected for because it hasn't been renamed improperly.
-        return (from column in columnInfo
+        return [.. (from column in columnInfo
                 let columnName = column["fieldName"]!.GetValue<string>()
                 where !columnsToDrop.Any(columnName.Equals)
-                select column["name"]!.GetValue<string>().ToLower().Replace(' ', '_'))!.ToArray();
+                select column["name"]!.GetValue<string>().ToLower().Replace(' ', '_'))!];
     }
     /// <summary>
     /// Builds an SQL command for the creation of a SQL Table for current instance.
@@ -1129,22 +1132,22 @@ public partial class Report
         builder.Append(",PRIMARY KEY (report_date_as_yyyy_mm_dd,cftc_contract_market_code)");
         return $"CREATE TABLE {_tableNameWithinDatabase} ({builder});";
     }
-    private readonly struct FieldInfo
+    private readonly struct FieldInfo(int columnIndex, string columnName, string editedColumnName)
     {
         /// <summary>
         /// Column Index of the given field within an array of data.
         /// </summary>
-        public int ColumnIndex { get; }
+        public int ColumnIndex { get; } = columnIndex;
 
         /// <summary>
         /// Name of the field within the database.
         /// </summary>
-        public string ColumnName { get; }
+        public string ColumnName { get; } = columnName;
 
         /// <summary>
         /// Edited version of <see cref="ColumnName"/> 
         /// </summary>
-        public string EditedColumnName { get; }
+        public string EditedColumnName { get; } = editedColumnName;
 
         /// <summary>
         /// Adjusts <see cref="ColumnName"/> so that it is database compatible.
@@ -1155,15 +1158,7 @@ public partial class Report
         /// <summary>
         /// String used to target an auto generated parameter when uploading to the database.
         /// </summary>
-        public string ParamName { get; }
-
-        public FieldInfo(int columnIndex, string columnName, string editedColumnName)
-        {
-            ColumnIndex = columnIndex;
-            ColumnName = columnName;
-            EditedColumnName = editedColumnName;
-            ParamName = $"@{columnName}";
-        }
+        public string ParamName { get; } = $"@{columnName}";
     }
 
     [GeneratedRegex("[,]{1}(?=(?:[^\"]*\"[^\"]*\")*(?![^\"]*\"))")]
