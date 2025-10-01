@@ -62,7 +62,7 @@ public partial class Report
     /// <summary>
     /// Backing field for <see cref="CurrentStatus"/> .
     /// </summary>
-    private ReportStatusCode _currentStatus;
+    private ReportStatusCode _currentStatus = ReportStatusCode.NoUpdateAvailable;
 
     /// <summary>
     /// The table name to target within the database.
@@ -103,6 +103,7 @@ public partial class Report
     /// <summary>
     /// Boolean used to control whether or not an instance where <see cref="IsLegacyCombined"/> = <see langword="false"/> can be released from its waiting loop.
     /// </summary>
+    /// <remarks>Can only be changed from a Legacy Combined version of class otherwise it is ignored.</remarks>
     public bool ReleaseLockedInstances
     {
         get => s_releaseLockedInstances;
@@ -282,117 +283,125 @@ public partial class Report
             await CreateReportTableIfMissingAsync().ConfigureAwait(false);
 
             DatabaseDateBeforeUpdate = DatabaseDateAfterUpdate = await GetLatestTableDateAsync(filterForIce: false).ConfigureAwait(false);
-            bool checkIceOnly = false;
-            if (!DebugActive)
+
+            TimeZoneInfo easternTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
+            DateTime nextReleaseExpectedDateTimeUTC = TimeZoneInfo.ConvertTimeToUtc(DatabaseDateBeforeUpdate.Add(new TimeSpan(7+DayOfWeek.Friday-DatabaseDateBeforeUpdate.DayOfWeek,15,30,0)),easternTimeZone) ;
+
+            if (DateTime.UtcNow >= nextReleaseExpectedDateTimeUTC)
             {
-                // Wait until after the Legacy_Combined instance has attempted CFTC retrieval before continuing.
-                if (!IsLegacyCombined)
+                bool checkIceOnly = false;
+                if (!DebugActive)
                 {
-                    // Loop until a change in state is detected in the running Legacy Combined instance.
-                    ActionTimer.Stop();
-                    while (!ReleaseLockedInstances)
+                    // Wait until after the Legacy_Combined instance has attempted CFTC retrieval before continuing.
+                    if (!IsLegacyCombined)
                     {
-                        await Task.Delay(300).ConfigureAwait(false);
-                    }
-
-                    var failureCodes = new ReportStatusCode[] { ReportStatusCode.NoUpdateAvailable, ReportStatusCode.Failure };
-
-                    if (failureCodes.Contains(s_retrievalLockingStatusCode) && DatabaseDateBeforeUpdate >= s_retrievalLockingDate)
-                    {
-                        // If lockin instance failed then use the appropriate enum else assign no update available.
-                        CurrentStatus = (s_retrievalLockingStatusCode == ReportStatusCode.Failure) ? ReportStatusCode.LockingInstanceFailure : ReportStatusCode.NoUpdateAvailable;
-                        checkIceOnly = CurrentStatus == ReportStatusCode.NoUpdateAvailable && QueriedReport == ReportType.Disaggregated;
-                        if (!checkIceOnly) return;
-                    }
-                    ActionTimer.Start();
-                }
-                else
-                {
-                    s_retrievalLockingDate = DatabaseDateBeforeUpdate;
-                }
-            }
-            // Headers from local database.
-            List<string> databaseFieldNames = await QueryDatabaseFieldNamesAsync().ConfigureAwait(false);
-
-            // (New data from API, Mapped FieldInfo instances for each column or null)
-            Task<(List<string[]>, Dictionary<string, FieldInfo>?, Dictionary<string, Dictionary<DateTime, decimal?>>?)>? cftcRetrievalTask = null;
-            var tasksToWaitFor = new List<Task>();
-            int queryReturnLimit = DebugActive ? 1_000 : 20_000;
-
-            if (!checkIceOnly)
-            {
-                cftcRetrievalTask = CftcCotRetrievalAsync(queryReturnLimit, databaseFieldNames);
-                tasksToWaitFor.Add(cftcRetrievalTask);
-            }
-
-            Task<List<string[]>?>? iceRetrievalTask = null;
-
-            if (QueriedReport == ReportType.Disaggregated)
-            {
-                // await cftc retrieval if not just checking ICE as DatabaseDateAfterUpdate may update.
-                if (!checkIceOnly && cftcRetrievalTask != null) await cftcRetrievalTask.ConfigureAwait(false);
-
-                iceRetrievalTask = IceCotRetrievalAsync(DatabaseDateAfterUpdate, databaseFieldNames, queryReturnLimit);
-                tasksToWaitFor.Add(iceRetrievalTask);
-            }
-
-            bool permitUpload = !DebugActive || testUpload;
-
-            while (tasksToWaitFor.Count != 0)
-            {
-                Task completedTask = await Task.WhenAny(tasksToWaitFor).ConfigureAwait(false);
-
-                if (completedTask == cftcRetrievalTask)
-                {
-                    (var cftcData, var cftcFieldInfoByEditedName, var priceByDateByContractCode) = await cftcRetrievalTask.ConfigureAwait(false);
-
-                    if (cftcData.Count != 0 && cftcFieldInfoByEditedName is not null)
-                    {
-                        // Only retrieve price data for Legacy Combined instances since it encompases both Disaggregated and Traders in Financial Futures reports.
-
-                        if (yahooPriceSymbolByContractCode != null && IsLegacyCombined && userAllowsPriceDownload && (priceByDateByContractCode?.Count ?? 0) > 0)
+                        // Loop until a change in state is detected in the running Legacy Combined instance.
+                        ActionTimer.Stop();
+                        while (!ReleaseLockedInstances)
                         {
-                            bool retrievePrices = true;
-                            if (DebugActive)
+                            await Task.Delay(300).ConfigureAwait(false);
+                        }
+
+                        var failureCodes = new ReportStatusCode[] { ReportStatusCode.NoUpdateAvailable, ReportStatusCode.Failure };
+
+                        if (failureCodes.Contains(s_retrievalLockingStatusCode) && DatabaseDateBeforeUpdate >= s_retrievalLockingDate)
+                        {
+                            // If lockin instance failed then use the appropriate enum else assign no update available.
+                            CurrentStatus = (s_retrievalLockingStatusCode == ReportStatusCode.Failure) ? ReportStatusCode.LockingInstanceFailure : ReportStatusCode.NoUpdateAvailable;
+                            checkIceOnly = CurrentStatus == ReportStatusCode.NoUpdateAvailable && QueriedReport == ReportType.Disaggregated;
+                            if (!checkIceOnly) return;
+                        }
+                        ActionTimer.Start();
+                    }
+                    else
+                    {
+                        s_retrievalLockingDate = DatabaseDateBeforeUpdate;
+                    }
+                }
+
+                // Headers from local database.
+                List<string> databaseFieldNames = await QueryDatabaseFieldNamesAsync().ConfigureAwait(false);
+
+                // (New data from API, Mapped FieldInfo instances for each column or null)
+                Task<(List<string[]>, Dictionary<string, FieldInfo>?, Dictionary<string, Dictionary<DateTime, decimal?>>?)>? cftcRetrievalTask = null;
+                var tasksToWaitFor = new List<Task>();
+                int queryReturnLimit = DebugActive ? 1_000 : 20_000;
+
+                if (!checkIceOnly)
+                {
+                    cftcRetrievalTask = CftcCotRetrievalAsync(queryReturnLimit, databaseFieldNames);
+                    tasksToWaitFor.Add(cftcRetrievalTask);
+                }
+
+                Task<List<string[]>?>? iceRetrievalTask = null;
+
+                if (QueriedReport == ReportType.Disaggregated)
+                {
+                    // await cftc retrieval if not just checking ICE as DatabaseDateAfterUpdate may update.
+                    if (!checkIceOnly && cftcRetrievalTask != null) await cftcRetrievalTask.ConfigureAwait(false);
+
+                    iceRetrievalTask = IceCotRetrievalAsync(DatabaseDateAfterUpdate, databaseFieldNames, queryReturnLimit);
+                    tasksToWaitFor.Add(iceRetrievalTask);
+                }
+
+                bool permitUpload = !DebugActive || testUpload;
+
+                while (tasksToWaitFor.Count != 0)
+                {
+                    Task completedTask = await Task.WhenAny(tasksToWaitFor).ConfigureAwait(false);
+
+                    if (completedTask == cftcRetrievalTask)
+                    {
+                        (var cftcData, var cftcFieldInfoByEditedName, var priceByDateByContractCode) = await cftcRetrievalTask.ConfigureAwait(false);
+
+                        if (cftcData.Count != 0 && cftcFieldInfoByEditedName is not null)
+                        {
+                            // Only retrieve price data for Legacy Combined instances since it encompases both Disaggregated and Traders in Financial Futures reports.
+
+                            if (yahooPriceSymbolByContractCode != null && IsLegacyCombined && userAllowsPriceDownload && (priceByDateByContractCode?.Count ?? 0) > 0)
                             {
-                                Console.WriteLine("Do you want to test price retrieval(Y/N)?");
-                                var keyResponse = Console.ReadKey(true);
-                                retrievePrices = keyResponse.Key == ConsoleKey.Y;
+                                bool retrievePrices = true;
+                                if (DebugActive)
+                                {
+                                    Console.WriteLine("Do you want to test price retrieval(Y/N)?");
+                                    var keyResponse = Console.ReadKey(true);
+                                    retrievePrices = keyResponse.Key == ConsoleKey.Y;
+                                }
+
+                                if (retrievePrices)
+                                {
+                                    tasksToWaitFor.Add(RetrieveAndUploadYahooPriceDataAsync(yahooPriceSymbolByContractCode, priceByDateByContractCode!));
+                                }
                             }
 
-                            if (retrievePrices)
+                            if (permitUpload)
                             {
-                                tasksToWaitFor.Add(RetrieveAndUploadYahooPriceDataAsync(yahooPriceSymbolByContractCode, priceByDateByContractCode!));
+                                // Make an attempt to upload CFTC data.
+                                tasksToWaitFor.Add(UploadToDatabaseAsync(fieldInfoPerEditedName: cftcFieldInfoByEditedName, dataToUpload: cftcData, false));
                             }
                         }
-
-                        if (permitUpload)
+                    }
+                    else if (completedTask == iceRetrievalTask)
+                    {
+                        try
                         {
-                            // Make an attempt to upload CFTC data.
-                            tasksToWaitFor.Add(UploadToDatabaseAsync(fieldInfoPerEditedName: cftcFieldInfoByEditedName, dataToUpload: cftcData, false));
+                            var iceData = await iceRetrievalTask.ConfigureAwait(false);
+                            if (permitUpload && s_iceColumnMap != null && ((iceData?.Count ?? 0) > 0))
+                            {
+                                tasksToWaitFor.Add(UploadToDatabaseAsync(fieldInfoPerEditedName: s_iceColumnMap, dataToUpload: iceData!, true));
+                            }
+                        }
+                        catch (Exception e1)
+                        {
+                            Console.WriteLine(e1);
                         }
                     }
-                }
-                else if (completedTask == iceRetrievalTask)
-                {
-                    try
-                    {
-                        var iceData = await iceRetrievalTask.ConfigureAwait(false);
-                        if (permitUpload && s_iceColumnMap != null && ((iceData?.Count ?? 0) > 0))
-                        {
-                            tasksToWaitFor.Add(UploadToDatabaseAsync(fieldInfoPerEditedName: s_iceColumnMap, dataToUpload: iceData!, true));
-                        }
+                    else
+                    {   // await task to catch any errors.
+                        await completedTask.ConfigureAwait(false);
                     }
-                    catch (Exception e1)
-                    {
-                        Console.WriteLine(e1);
-                    }
+                    tasksToWaitFor.Remove(completedTask);
                 }
-                else
-                {   // await task to catch any errors.
-                    await completedTask.ConfigureAwait(false);
-                }
-                tasksToWaitFor.Remove(completedTask);
             }
         }
         catch (Exception)
