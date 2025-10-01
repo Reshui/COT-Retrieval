@@ -132,11 +132,6 @@ public partial class Report
     private static readonly HttpClient s_cftcApiClient = new() { BaseAddress = new Uri("https://publicreporting.cftc.gov/resource/") };
 
     /// <summary>
-    /// Connection string used to connect to the SQL Server database.
-    /// </summary> 
-    private const string DatabaseConnectionString = "Data Source=.\\SQLEXPRESS01;Trusted_Connection=True;TrustServerCertificate=True;MultipleActiveResultSets=True;Connection Timeout=30";
-
-    /// <summary>
     ///  Gets a boolean value that represents if the current instance is Legacy Combined data.
     /// </summary>
     /// <value><see langword="true"/> if <see cref="QueriedReport"/> equals <see cref="ReportType.Legacy"/> and <see cref="RetrieveCombinedData"/> equals <see langword="true"/>; otherwise, <see langword="false"/>.</value>
@@ -204,7 +199,7 @@ public partial class Report
     /// <summary>
     /// An array containing a white space and quote character.
     /// </summary>
-    private readonly static char[] s_charactersToTrim = { ' ', '\"' };
+    private readonly static char[] s_charactersToTrim = [' ', '\"'];
     /// <summary>
     /// First letter of report type and C or F for combined or futures only.
     /// </summary>
@@ -238,9 +233,20 @@ public partial class Report
 
         if (s_databaseConnection == null)
         {
-            s_databaseConnection = new SqlConnection(DatabaseConnectionString);
+            var builder = new SqlConnectionStringBuilder()
+            {
+                DataSource = ".\\SQLEXPRESS",
+                IntegratedSecurity = true,
+                PersistSecurityInfo = false,
+                MultipleActiveResultSets = true,
+                TrustServerCertificate = true,
+                ConnectTimeout = 30,
+                ApplicationName = "C# Exe",
+            };
+            
+            s_databaseConnection = new SqlConnection(builder.ConnectionString);
             using var cmd = s_databaseConnection.CreateCommand();
-
+            
             cmd.CommandText = $"IF NOT Exists(Select name from sys.databases where name=@database) BEGIN CREATE DATABASE {DatabaseName}; END;";
             cmd.Parameters.AddWithValue("@database", DatabaseName);
 
@@ -871,9 +877,9 @@ public partial class Report
 
         using var reader = await cmd.ExecuteReaderAsync().ConfigureAwait(false);
 
-        List<string> fieldNames = (from columnSchema in await reader.GetColumnSchemaAsync().ConfigureAwait(false)
+        List<string> fieldNames = [.. from columnSchema in await reader.GetColumnSchemaAsync().ConfigureAwait(false)
                                    let fieldName = columnSchema.ColumnName
-                                   select fieldName).ToList();
+                                   select fieldName];
 
         await reader.CloseAsync().ConfigureAwait(false);
         return fieldNames;

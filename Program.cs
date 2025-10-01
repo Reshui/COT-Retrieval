@@ -106,7 +106,7 @@ if (args.Length == 2 || args.Length == 0)
         bool reportKey = instance.RetrieveCombinedData;
         if (!summary.TryGetValue(reportKey, out var innerDict))
         {
-            innerDict = summary[reportKey] = new();
+            innerDict = summary[reportKey] = [];
         }
 
         innerDict.Add(instance.QueriedReport.ToString()[0], instance.Summarized());
