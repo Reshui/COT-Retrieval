@@ -285,38 +285,35 @@ public partial class Report
             DatabaseDateBeforeUpdate = DatabaseDateAfterUpdate = await GetLatestTableDateAsync(filterForIce: false).ConfigureAwait(false);
 
             TimeZoneInfo easternTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
-            DateTime nextReleaseExpectedDateTimeUTC = TimeZoneInfo.ConvertTimeToUtc(DatabaseDateBeforeUpdate.Add(new TimeSpan(7+DayOfWeek.Friday-DatabaseDateBeforeUpdate.DayOfWeek,15,30,0)),easternTimeZone) ;
+            DateTime nextReleaseExpectedUTC = TimeZoneInfo.ConvertTimeToUtc(DatabaseDateBeforeUpdate.Add(new TimeSpan(7 + DayOfWeek.Friday - DatabaseDateBeforeUpdate.DayOfWeek, 15, 30, 0)), easternTimeZone);
 
-            if (DateTime.UtcNow >= nextReleaseExpectedDateTimeUTC)
+            if (DateTime.UtcNow >= nextReleaseExpectedUTC)
             {
                 bool checkIceOnly = false;
-                if (!DebugActive)
+                if (!DebugActive && !IsLegacyCombined)
                 {
                     // Wait until after the Legacy_Combined instance has attempted CFTC retrieval before continuing.
-                    if (!IsLegacyCombined)
+                    // Loop until a change in state is detected in the running Legacy Combined instance.
+                    ActionTimer.Stop();
+                    while (!ReleaseLockedInstances)
                     {
-                        // Loop until a change in state is detected in the running Legacy Combined instance.
-                        ActionTimer.Stop();
-                        while (!ReleaseLockedInstances)
-                        {
-                            await Task.Delay(300).ConfigureAwait(false);
-                        }
-
-                        var failureCodes = new ReportStatusCode[] { ReportStatusCode.NoUpdateAvailable, ReportStatusCode.Failure };
-
-                        if (failureCodes.Contains(s_retrievalLockingStatusCode) && DatabaseDateBeforeUpdate >= s_retrievalLockingDate)
-                        {
-                            // If lockin instance failed then use the appropriate enum else assign no update available.
-                            CurrentStatus = (s_retrievalLockingStatusCode == ReportStatusCode.Failure) ? ReportStatusCode.LockingInstanceFailure : ReportStatusCode.NoUpdateAvailable;
-                            checkIceOnly = CurrentStatus == ReportStatusCode.NoUpdateAvailable && QueriedReport == ReportType.Disaggregated;
-                            if (!checkIceOnly) return;
-                        }
-                        ActionTimer.Start();
+                        await Task.Delay(300).ConfigureAwait(false);
                     }
-                    else
+
+                    var failureCodes = new ReportStatusCode[] { ReportStatusCode.NoUpdateAvailable, ReportStatusCode.Failure };
+
+                    if (failureCodes.Contains(s_retrievalLockingStatusCode) && DatabaseDateBeforeUpdate >= s_retrievalLockingDate)
                     {
-                        s_retrievalLockingDate = DatabaseDateBeforeUpdate;
+                        // If lockin instance failed then use the appropriate enum else assign no update available.
+                        CurrentStatus = (s_retrievalLockingStatusCode == ReportStatusCode.Failure) ? ReportStatusCode.LockingInstanceFailure : ReportStatusCode.NoUpdateAvailable;
+                        checkIceOnly = CurrentStatus == ReportStatusCode.NoUpdateAvailable && QueriedReport == ReportType.Disaggregated;
+                        if (!checkIceOnly) return;
                     }
+                    ActionTimer.Start();
+                }
+                else
+                {
+                    s_retrievalLockingDate = DatabaseDateBeforeUpdate;                        
                 }
 
                 // Headers from local database.
@@ -357,7 +354,6 @@ public partial class Report
                         if (cftcData.Count != 0 && cftcFieldInfoByEditedName is not null)
                         {
                             // Only retrieve price data for Legacy Combined instances since it encompases both Disaggregated and Traders in Financial Futures reports.
-
                             if (yahooPriceSymbolByContractCode != null && IsLegacyCombined && userAllowsPriceDownload && (priceByDateByContractCode?.Count ?? 0) > 0)
                             {
                                 bool retrievePrices = true;
@@ -510,8 +506,7 @@ public partial class Report
                 }
             }
             responseLines = null;
-        }
-        ;
+        };
         return (newCftcData, fieldInfoByEditedName, priceByDateByContractCode);
     }
 
@@ -526,7 +521,10 @@ public partial class Report
     {
         DateTime maxIceDateInDatabase = await GetLatestTableDateAsync(filterForIce: true).ConfigureAwait(false);
 
-        if (QueriedReport != ReportType.Disaggregated || (maxIceDateInDatabase >= mostRecentCftcDate && !DebugActive)) return null;
+        TimeZoneInfo easternTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
+        DateTime nextReleaseExpectedUTC = TimeZoneInfo.ConvertTimeToUtc(maxIceDateInDatabase.Add(new TimeSpan(7 + DayOfWeek.Friday - maxIceDateInDatabase.DayOfWeek, 15, 30, 0)), easternTimeZone);
+
+        if (QueriedReport != ReportType.Disaggregated || ((maxIceDateInDatabase >= mostRecentCftcDate || DateTime.UtcNow < nextReleaseExpectedUTC) && !DebugActive)) return null;
 
         const byte MaxDayDifference = 9;
         bool singleWeekRetrieval = (mostRecentCftcDate - maxIceDateInDatabase).Days <= MaxDayDifference || DebugActive;
@@ -722,14 +720,21 @@ public partial class Report
                     if (string.IsNullOrEmpty(fieldValue)) param.Value = DBNull.Value;
                     else
                     {
-                        param.Value = param.SqlDbType switch
+                        try
                         {
-                            SqlDbType.Int or SqlDbType.SmallInt or SqlDbType.TinyInt => int.Parse(fieldValue, NumberStyles.AllowDecimalPoint | NumberStyles.AllowThousands | NumberStyles.AllowLeadingSign),
-                            SqlDbType.SmallMoney or SqlDbType.Decimal => decimal.Parse(fieldValue),
-                            SqlDbType.VarChar => fieldValue,
-                            SqlDbType.Date => DateTime.ParseExact(fieldValue, StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None),
-                            _ => throw new ArgumentOutOfRangeException(nameof(fieldInfoPerEditedName), param.SqlDbType, $"An unaccounted for SqlDbType was encountered when accessing {param.ParameterName}.")
-                        };
+                            param.Value = param.SqlDbType switch
+                            {
+                                SqlDbType.Int or SqlDbType.SmallInt or SqlDbType.TinyInt => int.Parse(fieldValue, NumberStyles.AllowDecimalPoint | NumberStyles.AllowThousands | NumberStyles.AllowLeadingSign),
+                                SqlDbType.SmallMoney or SqlDbType.Decimal => decimal.Parse(fieldValue),
+                                SqlDbType.VarChar => fieldValue,
+                                SqlDbType.Date => DateTime.ParseExact(fieldValue, StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None),
+                                _ => throw new ArgumentOutOfRangeException(nameof(fieldInfoPerEditedName), param.SqlDbType, $"An unaccounted for SqlDbType was encountered when accessing {param.ParameterName}.")
+                            };
+                        }
+                        catch (Exception)
+                        {
+                            param.Value = DBNull.Value;
+                        }
                     }
                 }
 
@@ -1006,7 +1011,7 @@ public partial class Report
             else if (!iceHeaders)
             {
                 // These endings are sorted by the orde r in which they appear within the api headers.
-                string[] endings = { "_all", "_old", "_other" };
+                string[] endings = ["_all", "_old", "_other"];
                 // Remove endings from editedTableFieldName until a match is found within headerIndexesByEditedName.
                 // Once found map column and then attempt to find additional substitutions.                
                 for (byte primaryEndingsIndex = 0; primaryEndingsIndex < endings.Length; ++primaryEndingsIndex)
