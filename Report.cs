@@ -856,7 +856,9 @@ public partial class Report
 
         using SqlCommand cmd = s_databaseConnection!.CreateCommand();
 
-        cmd.CommandText = $"SELECT MAX({StandardDateFieldName}) FROM {_tableNameWithinDatabase} Where {ContractCodeColumnName} {(filterForIce ? string.Empty : "NOT ")}In {IceCodes};";
+        string comparisonOperator = filterForIce ? "<" : "=";
+
+        cmd.CommandText = $"SELECT MAX({StandardDateFieldName}) FROM {_tableNameWithinDatabase}{(QueriedReport == ReportType.Disaggregated ? $" WHERE tot_rept_positions_long_all IS {(filterForIce ? "NULL" : "NOT NULL")}" : string.Empty)};";
         DateTime storedDate = s_defaultStartDate;
 
         if (s_databaseConnection!.State == ConnectionState.Closed)
