@@ -70,9 +70,11 @@ if (args.Length == 2 || args.Length == 0)
 
     foreach (bool retrieveCombinedData in new bool[] { true, false })
     {
-        foreach (ReportType reportType in Enum.GetValues(typeof(ReportType)))
+        foreach (ReportType reportType in Enum.GetValues<ReportType>())
         {
             if (debugMode && false == (reportType == ReportType.Legacy && retrieveCombinedData == true)) continue;
+            //if (debugMode && false == (reportType == ReportType.Disaggregated && retrieveCombinedData == true)) continue;
+
             var reportInstance = new Report(reportType, retrieveCombinedData, debugMode);
             updatingTasksByReport.Add(reportInstance, reportInstance.CommitmentsOfTradersRetrievalAndUploadAsync(reportInstance.IsLegacyCombined ? priceSymbolByContractCode : null, testUpload, downloadPriceData));
             if (debugMode) break;

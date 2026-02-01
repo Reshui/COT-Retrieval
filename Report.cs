@@ -20,7 +20,7 @@ public enum ReportType
 public enum ReportStatusCode
 {
     NoUpdateAvailable, Updated, Failure, AttemptingRetrieval, AttemptingUpdate, NotInitialized, CheckingDataAvailability,
-    OnlyDuplicateRecordsInUpdate, LockingInstanceFailure, FoundNewData
+    OnlyDuplicateRecordsInUpdate, LockingInstanceFailure, FoundNewData, ParsingReturnedData
 }
 
 public partial class Report
@@ -205,10 +205,6 @@ public partial class Report
     /// First letter of report type and C or F for combined or futures only.
     /// </summary>
     public string Id { get => $"{QueriedReport.ToString()[0]}{(RetrieveCombinedData ? 'C' : 'F')}"; }
-    /// <summary>
-    /// SQL query text used when checking if a contract code is from the ICE COT reports.
-    /// </summary>
-    private const string IceCodes = "('B','Cocoa','G','RC','Wheat','W')";
 
     /// <summary>
     /// Initializes a new instance of the Report class with the specified properties.
@@ -244,10 +240,10 @@ public partial class Report
                 ConnectTimeout = 30,
                 ApplicationName = "C# Exe",
             };
-            
+
             s_databaseConnection = new SqlConnection(builder.ConnectionString);
             using var cmd = s_databaseConnection.CreateCommand();
-            
+
             cmd.CommandText = $"IF NOT Exists(Select name from sys.databases where name=@database) BEGIN CREATE DATABASE {DatabaseName}; END;";
             cmd.Parameters.AddWithValue("@database", DatabaseName);
 
@@ -284,120 +280,117 @@ public partial class Report
 
             DatabaseDateBeforeUpdate = DatabaseDateAfterUpdate = await GetLatestTableDateAsync(filterForIce: false).ConfigureAwait(false);
 
-            TimeZoneInfo easternTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
-            DateTime nextReleaseExpectedUTC = TimeZoneInfo.ConvertTimeToUtc(DatabaseDateBeforeUpdate.Add(new TimeSpan(7 + DayOfWeek.Friday - DatabaseDateBeforeUpdate.DayOfWeek, 15, 30, 0)), easternTimeZone);
+            bool checkIceOnly = false; //|| (QueriedReport == ReportType.Disaggregated && cftcDatabaseIsUpdateNeeded == false);
 
-            if (DateTime.UtcNow >= nextReleaseExpectedUTC)
+            if (!DebugActive && !IsLegacyCombined)
             {
-                bool checkIceOnly = false;
-                if (!DebugActive && !IsLegacyCombined)
+                // Wait until after the Legacy_Combined instance has attempted CFTC retrieval before continuing.
+                // Loop until a change in state is detected in the running Legacy Combined instance.
+                ActionTimer.Stop();
+                while (!ReleaseLockedInstances)
                 {
-                    // Wait until after the Legacy_Combined instance has attempted CFTC retrieval before continuing.
-                    // Loop until a change in state is detected in the running Legacy Combined instance.
-                    ActionTimer.Stop();
-                    while (!ReleaseLockedInstances)
-                    {
-                        await Task.Delay(300).ConfigureAwait(false);
-                    }
+                    await Task.Delay(300).ConfigureAwait(false);
+                }
 
-                    var failureCodes = new ReportStatusCode[] { ReportStatusCode.NoUpdateAvailable, ReportStatusCode.Failure };
+                var failureCodes = new ReportStatusCode[] { ReportStatusCode.NoUpdateAvailable, ReportStatusCode.Failure };
 
-                    if (failureCodes.Contains(s_retrievalLockingStatusCode) && DatabaseDateBeforeUpdate >= s_retrievalLockingDate)
+                if (failureCodes.Contains(s_retrievalLockingStatusCode) && DatabaseDateBeforeUpdate >= s_retrievalLockingDate)
+                {
+                    // If lockin instance failed then use the appropriate enum else assign no update available.
+                    CurrentStatus = (s_retrievalLockingStatusCode == ReportStatusCode.Failure) ? ReportStatusCode.LockingInstanceFailure : ReportStatusCode.NoUpdateAvailable;
+                    checkIceOnly = CurrentStatus == ReportStatusCode.NoUpdateAvailable && QueriedReport == ReportType.Disaggregated;
+                    if (!checkIceOnly) return;
+                }
+                ActionTimer.Start();
+            }
+            else
+            {
+                s_retrievalLockingDate = DatabaseDateBeforeUpdate;
+            }
+
+            // Headers from local database.
+            List<string> databaseFieldNames = await QueryDatabaseFieldNamesAsync().ConfigureAwait(false);
+
+            // (New data from API, Mapped FieldInfo instances for each column or null)
+            Task<(List<string[]>, Dictionary<string, FieldInfo>?, Dictionary<string, Dictionary<DateTime, decimal?>>?)>? cftcRetrievalTask = null;
+            var tasksToWaitFor = new List<Task>();
+            int queryReturnLimit = DebugActive ? 1_000 : 20_000;
+
+            if (DebugActive && QueriedReport == ReportType.Disaggregated) checkIceOnly = true;
+
+            if (!checkIceOnly)
+            {
+                cftcRetrievalTask = CftcCotRetrievalAsync(queryReturnLimit, databaseFieldNames);
+                tasksToWaitFor.Add(cftcRetrievalTask);
+            }
+
+            Task<List<string[]>?>? iceRetrievalTask = null;
+
+            if (QueriedReport == ReportType.Disaggregated)
+            {
+                // await cftc retrieval if not just checking ICE as DatabaseDateAfterUpdate may update.
+                if (!checkIceOnly && cftcRetrievalTask != null) await cftcRetrievalTask.ConfigureAwait(false);
+
+                iceRetrievalTask = IceCotRetrievalAsync(DatabaseDateAfterUpdate, databaseFieldNames, queryReturnLimit);
+                tasksToWaitFor.Add(iceRetrievalTask);
+            }
+
+            bool permitUpload = !DebugActive || testUpload;
+
+            while (tasksToWaitFor.Count != 0)
+            {
+                Task completedTask = await Task.WhenAny(tasksToWaitFor).ConfigureAwait(false);
+
+                if (completedTask == cftcRetrievalTask)
+                {
+                    (var cftcData, var cftcFieldInfoByEditedName, var priceByDateByContractCode) = await cftcRetrievalTask.ConfigureAwait(false);
+
+                    if (cftcData.Count != 0 && cftcFieldInfoByEditedName is not null)
                     {
-                        // If lockin instance failed then use the appropriate enum else assign no update available.
-                        CurrentStatus = (s_retrievalLockingStatusCode == ReportStatusCode.Failure) ? ReportStatusCode.LockingInstanceFailure : ReportStatusCode.NoUpdateAvailable;
-                        checkIceOnly = CurrentStatus == ReportStatusCode.NoUpdateAvailable && QueriedReport == ReportType.Disaggregated;
-                        if (!checkIceOnly) return;
+                        // Only retrieve price data for Legacy Combined instances since it encompases both Disaggregated and Traders in Financial Futures reports.
+                        if (yahooPriceSymbolByContractCode != null && IsLegacyCombined && userAllowsPriceDownload && (priceByDateByContractCode?.Count ?? 0) > 0)
+                        {
+                            bool retrievePrices = true;
+                            if (DebugActive)
+                            {
+                                Console.WriteLine("Do you want to test price retrieval(Y/N)?");
+                                var keyResponse = Console.ReadKey(true);
+                                retrievePrices = keyResponse.Key == ConsoleKey.Y;
+                            }
+
+                            if (retrievePrices)
+                            {
+                                tasksToWaitFor.Add(RetrieveAndUploadYahooPriceDataAsync(yahooPriceSymbolByContractCode, priceByDateByContractCode!));
+                            }
+                        }
+
+                        if (permitUpload)
+                        {
+                            // Make an attempt to upload CFTC data.
+                            tasksToWaitFor.Add(UploadToDatabaseAsync(fieldInfoPerEditedName: cftcFieldInfoByEditedName, dataToUpload: cftcData, false));
+                        }
                     }
-                    ActionTimer.Start();
+                }
+                else if (completedTask == iceRetrievalTask)
+                {
+                    try
+                    {
+                        var iceData = await iceRetrievalTask.ConfigureAwait(false);
+                        if (permitUpload && s_iceColumnMap != null && ((iceData?.Count ?? 0) > 0))
+                        {
+                            tasksToWaitFor.Add(UploadToDatabaseAsync(fieldInfoPerEditedName: s_iceColumnMap, dataToUpload: iceData!, true));
+                        }
+                    }
+                    catch (Exception e1)
+                    {
+                        Console.WriteLine(e1);
+                    }
                 }
                 else
-                {
-                    s_retrievalLockingDate = DatabaseDateBeforeUpdate;                        
+                {   // await task to catch any errors.
+                    await completedTask.ConfigureAwait(false);
                 }
-
-                // Headers from local database.
-                List<string> databaseFieldNames = await QueryDatabaseFieldNamesAsync().ConfigureAwait(false);
-
-                // (New data from API, Mapped FieldInfo instances for each column or null)
-                Task<(List<string[]>, Dictionary<string, FieldInfo>?, Dictionary<string, Dictionary<DateTime, decimal?>>?)>? cftcRetrievalTask = null;
-                var tasksToWaitFor = new List<Task>();
-                int queryReturnLimit = DebugActive ? 1_000 : 20_000;
-
-                if (!checkIceOnly)
-                {
-                    cftcRetrievalTask = CftcCotRetrievalAsync(queryReturnLimit, databaseFieldNames);
-                    tasksToWaitFor.Add(cftcRetrievalTask);
-                }
-
-                Task<List<string[]>?>? iceRetrievalTask = null;
-
-                if (QueriedReport == ReportType.Disaggregated)
-                {
-                    // await cftc retrieval if not just checking ICE as DatabaseDateAfterUpdate may update.
-                    if (!checkIceOnly && cftcRetrievalTask != null) await cftcRetrievalTask.ConfigureAwait(false);
-
-                    iceRetrievalTask = IceCotRetrievalAsync(DatabaseDateAfterUpdate, databaseFieldNames, queryReturnLimit);
-                    tasksToWaitFor.Add(iceRetrievalTask);
-                }
-
-                bool permitUpload = !DebugActive || testUpload;
-
-                while (tasksToWaitFor.Count != 0)
-                {
-                    Task completedTask = await Task.WhenAny(tasksToWaitFor).ConfigureAwait(false);
-
-                    if (completedTask == cftcRetrievalTask)
-                    {
-                        (var cftcData, var cftcFieldInfoByEditedName, var priceByDateByContractCode) = await cftcRetrievalTask.ConfigureAwait(false);
-
-                        if (cftcData.Count != 0 && cftcFieldInfoByEditedName is not null)
-                        {
-                            // Only retrieve price data for Legacy Combined instances since it encompases both Disaggregated and Traders in Financial Futures reports.
-                            if (yahooPriceSymbolByContractCode != null && IsLegacyCombined && userAllowsPriceDownload && (priceByDateByContractCode?.Count ?? 0) > 0)
-                            {
-                                bool retrievePrices = true;
-                                if (DebugActive)
-                                {
-                                    Console.WriteLine("Do you want to test price retrieval(Y/N)?");
-                                    var keyResponse = Console.ReadKey(true);
-                                    retrievePrices = keyResponse.Key == ConsoleKey.Y;
-                                }
-
-                                if (retrievePrices)
-                                {
-                                    tasksToWaitFor.Add(RetrieveAndUploadYahooPriceDataAsync(yahooPriceSymbolByContractCode, priceByDateByContractCode!));
-                                }
-                            }
-
-                            if (permitUpload)
-                            {
-                                // Make an attempt to upload CFTC data.
-                                tasksToWaitFor.Add(UploadToDatabaseAsync(fieldInfoPerEditedName: cftcFieldInfoByEditedName, dataToUpload: cftcData, false));
-                            }
-                        }
-                    }
-                    else if (completedTask == iceRetrievalTask)
-                    {
-                        try
-                        {
-                            var iceData = await iceRetrievalTask.ConfigureAwait(false);
-                            if (permitUpload && s_iceColumnMap != null && ((iceData?.Count ?? 0) > 0))
-                            {
-                                tasksToWaitFor.Add(UploadToDatabaseAsync(fieldInfoPerEditedName: s_iceColumnMap, dataToUpload: iceData!, true));
-                            }
-                        }
-                        catch (Exception e1)
-                        {
-                            Console.WriteLine(e1);
-                        }
-                    }
-                    else
-                    {   // await task to catch any errors.
-                        await completedTask.ConfigureAwait(false);
-                    }
-                    tasksToWaitFor.Remove(completedTask);
-                }
+                tasksToWaitFor.Remove(completedTask);
             }
         }
         catch (Exception)
@@ -412,7 +405,17 @@ public partial class Report
             ReleaseLockedInstances = true;
         }
     }
-
+    /// <summary>
+    /// Determines if an update check is permitted based on the provided <paramref name="referenceDate"/> being more than 7 days from the related week's Friday.
+    /// </summary>
+    /// <param name="referenceDate">Date used to determine if an update check is permitted.</param>
+    /// <returns></returns>
+    private static bool PermitUpdateCheck(DateTime referenceDate)
+    {
+        TimeZoneInfo easternTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
+        DateTime nextReleaseExpectedUTC = TimeZoneInfo.ConvertTimeToUtc(referenceDate.Add(new TimeSpan(7 + DayOfWeek.Friday - referenceDate.DayOfWeek, 15, 30, 0)), easternTimeZone);
+        return DateTime.UtcNow >= nextReleaseExpectedUTC;
+    }
     /// <summary>
     /// Retrieves CFTC Commitments of Traders data if any data has a date value more recent than <see cref="DatabaseDateBeforeUpdate"/>. 
     /// </summary>
@@ -447,66 +450,66 @@ public partial class Report
         // Make initial API call to find out how many new records are available. Executed only once.
         var countRecordsUrl = $"{_cftcApiCode}{WantedDataFormat}?$select=count(id)&$where={StandardDateFieldName}{comparisonOperator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'";
 
-        CurrentStatus = ReportStatusCode.CheckingDataAvailability;
-
-        string? response = await s_cftcApiClient.GetStringAsync(countRecordsUrl).ConfigureAwait(false);
-
-        remainingRecordsToRetrieve = int.Parse(response.Split('\n')[1].Trim(s_charactersToTrim), NumberStyles.Number, null);
-
-        if (remainingRecordsToRetrieve > 0)
+        if (PermitUpdateCheck(DatabaseDateBeforeUpdate) || DebugActive)
         {
-            if (DebugActive) remainingRecordsToRetrieve = Math.Min(maxRecordsPerLoop, remainingRecordsToRetrieve);
-            CurrentStatus = ReportStatusCode.FoundNewData;
-        }
-        else
-        {
-            CurrentStatus = ReportStatusCode.NoUpdateAvailable;
-        }
+            CurrentStatus = ReportStatusCode.CheckingDataAvailability;
+            string? response = await s_cftcApiClient.GetStringAsync(countRecordsUrl).ConfigureAwait(false);
 
-        ReleaseLockedInstances = true;
-        while (remainingRecordsToRetrieve > 0)
-        {
-            CurrentStatus = ReportStatusCode.AttemptingRetrieval;
-            string apiDetails = $"{_cftcApiCode}{WantedDataFormat}?$where={StandardDateFieldName}{comparisonOperator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'&$order=report_date_as_yyyy_mm_dd,id&$limit={maxRecordsPerLoop}&$offset={offsetCount++}";
-            response = await s_cftcApiClient.GetStringAsync(apiDetails).ConfigureAwait(false);
+            remainingRecordsToRetrieve = int.Parse(response.Split('\n')[1].Trim(s_charactersToTrim), NumberStyles.Number, null);
 
-            // Data from the API tends to have an extra line at the end so trim it.
-            responseLines = response.Trim('\n').Split('\n');
-            response = null;
-            // Subtract 1 to account for headers.
-            remainingRecordsToRetrieve -= responseLines.Length - 1;
-
-            fieldInfoByEditedName ??= MapHeaderFieldsToDatabase(externalHeaders: SplitOnCommaNotWithinQuotesRegex().Split(responseLines[0]), databaseFields: databaseFieldNames, iceHeaders: false);
-
-            int cftcDateColumn = fieldInfoByEditedName[$"@{StandardDateFieldName}"].ColumnIndex;
-            int cftcCodeColumn = fieldInfoByEditedName[$"@{ContractCodeColumnName}"].ColumnIndex;
-
-            // Start index at 1 rather than 0 to skip over headers.
-            for (var i = 1; i < responseLines.Length; ++i)
+            if (remainingRecordsToRetrieve > 0)
             {
-                if (!string.IsNullOrEmpty(responseLines[i]))
-                {
-                    string[] apiRecord = [.. SplitOnCommaNotWithinQuotesRegex().Split(responseLines[i]).Select(x => x.Trim(s_charactersToTrim))];
+                CurrentStatus = ReportStatusCode.ParsingReturnedData;
+                ReleaseLockedInstances = true;
+                if (DebugActive) remainingRecordsToRetrieve = Math.Min(maxRecordsPerLoop, remainingRecordsToRetrieve);                
 
-                    if (DateTime.TryParseExact(apiRecord[cftcDateColumn], StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime parsedDate)
-                    && ((parsedDate > DatabaseDateBeforeUpdate && !DebugActive) || (parsedDate >= DatabaseDateBeforeUpdate && DebugActive)))
-                    {   // Create a null entry for the current combination of contract code and date within priceByDateByContractCode.
-                        if (IsLegacyCombined)
+                while (remainingRecordsToRetrieve > 0)
+                {
+                    string apiDetails = $"{_cftcApiCode}{WantedDataFormat}?$where={StandardDateFieldName}{comparisonOperator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'&$order=report_date_as_yyyy_mm_dd,id&$limit={maxRecordsPerLoop}&$offset={offsetCount++}";
+                    response = await s_cftcApiClient.GetStringAsync(apiDetails).ConfigureAwait(false);
+
+                    // Data from the API tends to have an extra line at the end so trim it.
+                    responseLines = response.Trim('\n').Split('\n');
+                    response = null;
+                    // Subtract 1 to account for headers.
+                    remainingRecordsToRetrieve -= responseLines.Length - 1;
+
+                    fieldInfoByEditedName ??= MapHeaderFieldsToDatabase(externalHeaders: SplitOnCommaNotWithinQuotesRegex().Split(responseLines[0]), databaseFields: databaseFieldNames, iceHeaders: false);
+
+                    int cftcDateColumn = fieldInfoByEditedName[$"@{StandardDateFieldName}"].ColumnIndex;
+                    int cftcCodeColumn = fieldInfoByEditedName[$"@{ContractCodeColumnName}"].ColumnIndex;
+
+                    // Start index at 1 rather than 0 to skip over headers.
+                    for (var i = 1; i < responseLines.Length; ++i)
+                    {
+                        if (!string.IsNullOrEmpty(responseLines[i]))
                         {
-                            string currentContractCode = apiRecord[cftcCodeColumn];
-                            if (!priceByDateByContractCode!.TryGetValue(currentContractCode, out Dictionary<DateTime, decimal?>? priceByDateForContractCode))
-                            {
-                                priceByDateForContractCode = priceByDateByContractCode[currentContractCode] = [];
+                            string[] apiRecord = [.. SplitOnCommaNotWithinQuotesRegex().Split(responseLines[i]).Select(x => x.Trim(s_charactersToTrim))];
+
+                            if (DateTime.TryParseExact(apiRecord[cftcDateColumn], StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime parsedDate)
+                            && ((parsedDate > DatabaseDateBeforeUpdate && !DebugActive) || (parsedDate >= DatabaseDateBeforeUpdate && DebugActive)))
+                            {   // Create a null entry for the current combination of contract code and date within priceByDateByContractCode.
+                                if (IsLegacyCombined)
+                                {
+                                    string currentContractCode = apiRecord[cftcCodeColumn];
+                                    if (!priceByDateByContractCode!.TryGetValue(currentContractCode, out Dictionary<DateTime, decimal?>? priceByDateForContractCode))
+                                    {
+                                        priceByDateForContractCode = priceByDateByContractCode[currentContractCode] = [];
+                                    }
+                                    priceByDateForContractCode.TryAdd(parsedDate, null);
+                                }
+                                newCftcData.Add(apiRecord);
+                                if (parsedDate > DatabaseDateAfterUpdate) DatabaseDateAfterUpdate = parsedDate;
                             }
-                            priceByDateForContractCode.TryAdd(parsedDate, null);
                         }
-                        newCftcData.Add(apiRecord);
-                        if (parsedDate > DatabaseDateAfterUpdate) DatabaseDateAfterUpdate = parsedDate;
                     }
+                    responseLines = null;
                 }
+                ;
             }
-            responseLines = null;
-        };
+        }
+        if (CurrentStatus != ReportStatusCode.ParsingReturnedData) CurrentStatus = ReportStatusCode.NoUpdateAvailable;
+
         return (newCftcData, fieldInfoByEditedName, priceByDateByContractCode);
     }
 
@@ -521,10 +524,7 @@ public partial class Report
     {
         DateTime maxIceDateInDatabase = await GetLatestTableDateAsync(filterForIce: true).ConfigureAwait(false);
 
-        TimeZoneInfo easternTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
-        DateTime nextReleaseExpectedUTC = TimeZoneInfo.ConvertTimeToUtc(maxIceDateInDatabase.Add(new TimeSpan(7 + DayOfWeek.Friday - maxIceDateInDatabase.DayOfWeek, 15, 30, 0)), easternTimeZone);
-
-        if (QueriedReport != ReportType.Disaggregated || ((maxIceDateInDatabase >= mostRecentCftcDate || DateTime.UtcNow < nextReleaseExpectedUTC) && !DebugActive)) return null;
+        if (QueriedReport != ReportType.Disaggregated || (!PermitUpdateCheck(maxIceDateInDatabase) && !DebugActive)) return null;
 
         const byte MaxDayDifference = 9;
         bool singleWeekRetrieval = (mostRecentCftcDate - maxIceDateInDatabase).Days <= MaxDayDifference || DebugActive;
@@ -722,14 +722,22 @@ public partial class Report
                     {
                         try
                         {
-                            param.Value = param.SqlDbType switch
+                            if (DebugActive && param.ParameterName.Equals($"@{StandardDateFieldName}"))
                             {
-                                SqlDbType.Int or SqlDbType.SmallInt or SqlDbType.TinyInt => int.Parse(fieldValue, NumberStyles.AllowDecimalPoint | NumberStyles.AllowThousands | NumberStyles.AllowLeadingSign),
-                                SqlDbType.SmallMoney or SqlDbType.Decimal => decimal.Parse(fieldValue),
-                                SqlDbType.VarChar => fieldValue,
-                                SqlDbType.Date => DateTime.ParseExact(fieldValue, StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None),
-                                _ => throw new ArgumentOutOfRangeException(nameof(fieldInfoPerEditedName), param.SqlDbType, $"An unaccounted for SqlDbType was encountered when accessing {param.ParameterName}.")
-                            };
+                                // In debug mode, increment date by 70 to avoid primary key violations.
+                                param.Value = DateTime.ParseExact(fieldValue, StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None).AddYears(70);
+                            }
+                            else
+                            {
+                                param.Value = param.SqlDbType switch
+                                {
+                                    SqlDbType.Int or SqlDbType.SmallInt or SqlDbType.TinyInt => int.Parse(fieldValue, NumberStyles.AllowDecimalPoint | NumberStyles.AllowThousands | NumberStyles.AllowLeadingSign),
+                                    SqlDbType.SmallMoney or SqlDbType.Decimal => decimal.Parse(fieldValue),
+                                    SqlDbType.VarChar => fieldValue,
+                                    SqlDbType.Date => DateTime.ParseExact(fieldValue, StandardDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None),
+                                    _ => throw new ArgumentOutOfRangeException(nameof(fieldInfoPerEditedName), param.SqlDbType, $"An unaccounted for SqlDbType was encountered when accessing {param.ParameterName}.")
+                                };
+                            }
                         }
                         catch (Exception)
                         {
@@ -751,10 +759,9 @@ public partial class Report
                 }
             }
             transaction.Commit();
-            if (!uploadingIceData)
-            {
-                CurrentStatus = successfullyInsertedRecords ? ReportStatusCode.Updated : (duplicateInsertionCount == dataToUpload.Count) ? ReportStatusCode.OnlyDuplicateRecordsInUpdate : ReportStatusCode.Failure;
-            }
+
+            CurrentStatus = successfullyInsertedRecords ? ReportStatusCode.Updated : (duplicateInsertionCount == dataToUpload.Count) ? ReportStatusCode.OnlyDuplicateRecordsInUpdate : ReportStatusCode.Failure;
+
         }
         catch (Exception)
         {
@@ -933,11 +940,12 @@ public partial class Report
         for (var i = 0; i < externalHeaders.Length; ++i)
         {
             var header = externalHeaders[i].ToLower();
+
+            if (header.Contains("open_interest")) header = header.Replace("open_interest", "oi");
             if (!iceHeaders)
             {
                 if (header.Contains("spead")) header = header.Replace("spead", "spread");
                 if (header.Contains("postions")) header = header.Replace("postions", "positions");
-                if (header.Contains("open_interest")) header = header.Replace("open_interest", "oi");
                 if (header.Contains("__")) header = header.Replace("__", "_");
                 externalHeaders[i] = header.Replace("\"", string.Empty);
             }
