@@ -429,16 +429,6 @@ public partial class Report
     /// <exception cref="NullReferenceException">Thrown if an attempt to use a null value from fieldInfoByEditedName dictionary.</exception>
     private async Task<(List<string[]>, Dictionary<string, FieldInfo>?, Dictionary<string, Dictionary<DateTime, decimal?>>?)> CftcCotRetrievalAsync(int maxRecordsPerLoop, List<string> databaseFieldNames)
     {
-        // https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types
-        const string WantedDataFormat = ".csv", MimeType = "text/csv";
-        int offsetCount = 0, remainingRecordsToRetrieve = 0;
-        string[]? responseLines = null;
-
-        HttpHeaderValueCollection<MediaTypeWithQualityHeaderValue> acceptHeaders = s_cftcApiClient.DefaultRequestHeaders.Accept;
-        if (acceptHeaders.Count == 0)
-        {
-            acceptHeaders.Add(new MediaTypeWithQualityHeaderValue(MimeType));
-        }
         // List will contain records cleared for database upload.
         List<string[]> newCftcData = [];
         // Dictionary will hold mapped FieldInfo instances for fields within the API and local database.
@@ -446,12 +436,22 @@ public partial class Report
         // This Dictionary will price dictionaries keyed to each contracts contract code.
         Dictionary<string, Dictionary<DateTime, decimal?>>? priceByDateByContractCode = IsLegacyCombined ? [] : null;
 
-        string comparisonOperator = DebugActive ? ">=" : ">";
-        // Make initial API call to find out how many new records are available. Executed only once.
-        var countRecordsUrl = $"{_cftcApiCode}{WantedDataFormat}?$select=count(id)&$where={StandardDateFieldName}{comparisonOperator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'";
-
         if (PermitUpdateCheck(DatabaseDateBeforeUpdate) || DebugActive)
         {
+            // https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types
+            const string WantedDataFormat = ".csv", MimeType = "text/csv";
+            int offsetCount = 0, remainingRecordsToRetrieve = 0;
+            string[]? responseLines = null;
+
+            HttpHeaderValueCollection<MediaTypeWithQualityHeaderValue> acceptHeaders = s_cftcApiClient.DefaultRequestHeaders.Accept;
+            if (acceptHeaders.Count == 0)
+            {
+                acceptHeaders.Add(new MediaTypeWithQualityHeaderValue(MimeType));
+            }
+            string comparisonOperator = DebugActive ? ">=" : ">";
+            // Make initial API call to find out how many new records are available. Executed only once.
+            var countRecordsUrl = $"{_cftcApiCode}{WantedDataFormat}?$select=count(id)&$where={StandardDateFieldName}{comparisonOperator}'{DatabaseDateBeforeUpdate.ToString(StandardDateFormat)}'";
+
             CurrentStatus = ReportStatusCode.CheckingDataAvailability;
             string? response = await s_cftcApiClient.GetStringAsync(countRecordsUrl).ConfigureAwait(false);
 
@@ -461,7 +461,7 @@ public partial class Report
             {
                 CurrentStatus = ReportStatusCode.ParsingReturnedData;
                 ReleaseLockedInstances = true;
-                if (DebugActive) remainingRecordsToRetrieve = Math.Min(maxRecordsPerLoop, remainingRecordsToRetrieve);                
+                if (DebugActive) remainingRecordsToRetrieve = Math.Min(maxRecordsPerLoop, remainingRecordsToRetrieve);
 
                 while (remainingRecordsToRetrieve > 0)
                 {
@@ -531,7 +531,7 @@ public partial class Report
         const string WeeklyIceKey = "Weekly_ICE";
 
         Interlocked.Increment(ref s_activeIceRetrievalCount);
-        // nulls ae added instead of Tasks because the compiler will attempt to execute the task instead of immediately checking the key.
+        // nulls are added instead of Tasks because the compiler will attempt to execute the task instead of immediately checking the key.
         if (singleWeekRetrieval && s_iceCsvRawData.TryAdd(WeeklyIceKey, null))
         {
             string iceCsvUrl = $"https://www.ice.com/publicdocs/cot_report/automated/COT_{mostRecentCftcDate:ddMMyyyy}.csv";
@@ -947,7 +947,7 @@ public partial class Report
                 if (header.Contains("spead")) header = header.Replace("spead", "spread");
                 if (header.Contains("postions")) header = header.Replace("postions", "positions");
                 if (header.Contains("__")) header = header.Replace("__", "_");
-                externalHeaders[i] = header.Replace("\"", string.Empty);
+                externalHeaders[i] = header.Contains('"') ? header.Replace("\"", string.Empty) : header;
             }
             else
             {
